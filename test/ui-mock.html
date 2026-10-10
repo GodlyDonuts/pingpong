@@ -1,0 +1,223 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>Poddle UI mock</title>
+<link rel="stylesheet" href="../web/ui.css">
+<style>
+  /* mock-only: placeholder court, frozen animation frames for screenshots, and the contact sheet */
+  #stage svg{width:100%;height:100%;display:block}
+  .freeze *, .freeze *::before, .freeze *::after{animation-play-state:paused!important;animation-delay:var(--freeze-at,-700ms)!important}
+  .freeze .callout{--freeze-at:-600ms} .freeze .light{--freeze-at:0ms} .freeze .medal{--freeze-at:-1200ms} .freeze .medal-disc::after{--freeze-at:-1150ms}
+  .freeze .result-slam.is-rank{--freeze-at:-230ms} .freeze .trophy-em .medal-rays{--freeze-at:-400ms}      /* RANK UP mid-slam, the rank-up's rays open */
+  .freeze .tally-num,.freeze .tally-num::before,.freeze .trophy-n,.freeze .trophy-n::before{--freeze-at:-2200ms}      /* the counts landed: the numbers read in a still frame */
+  .freeze .result-flash.is-sweep{--freeze-at:-995ms}      /* the rank-up light sweep has passed: no bright band across the names in a still (NOTES 117) */
+  #stage.bg-court svg,#stage.bg-grass svg{display:none} #stage.bg-court{background:#3569b8} #stage.bg-grass{background:#4b9a66}      /* &bg=court|grass: the grounds the white key hints must read on */
+  .fake-cam{aspect-ratio:16/9;background:radial-gradient(circle at 50% 38%,#f1c9a5 0 9%,transparent 9.5%),radial-gradient(ellipse 22% 34% at 50% 92%,#4f7fb3 0 98%,transparent 100%),linear-gradient(180deg,#cfd8de,#aab6bf)}
+  .fake-pod{aspect-ratio:1;display:grid;place-items:center} .fake-pod svg{width:62%}
+  body.sheet{overflow:auto;height:auto;background:#e8f1f6}
+  html.sheet-root{overflow:auto;height:auto;font-size:16px}
+  #sheet{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;padding:24px}
+  #sheet figure{margin:0} #sheet figcaption{font:800 13px/1 var(--font);letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 8px 4px}
+  #sheet .thumb{position:relative;width:100%;aspect-ratio:1440/900;overflow:hidden;border-radius:12px;box-shadow:var(--sh-2);background:#fff}
+  #sheet iframe{position:absolute;left:0;top:0;width:1440px;height:900px;border:0;transform-origin:0 0}
+</style>
+
+<!-- ======================= placeholder 3D scene (the real page has the three.js canvas here) ======================= -->
+<div id="stage" hidden>
+  <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+    <defs>
+      <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8ec5ee"/><stop offset="1" stop-color="#e8f5fb"/></linearGradient>
+      <linearGradient id="grass" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3f8d5c"/><stop offset="1" stop-color="#4b9a66"/></linearGradient>
+      <pattern id="net" width="7" height="7" patternUnits="userSpaceOnUse"><path d="M0 0H7M0 0V7" stroke="#1d2a33" stroke-width="1" opacity=".55"/></pattern>
+    </defs>
+    <rect width="1440" height="250" fill="url(#sky)"/>
+    <g fill="#3d8a4c"><circle cx="110" cy="170" r="52"/><circle cx="160" cy="150" r="40"/><circle cx="300" cy="185" r="58"/><circle cx="500" cy="170" r="56"/><circle cx="690" cy="160" r="70"/><circle cx="845" cy="150" r="78"/><circle cx="940" cy="165" r="40"/><circle cx="1300" cy="170" r="70"/><circle cx="1400" cy="160" r="80"/></g>
+    <g fill="#6b3f26"><rect x="112" y="205" width="12" height="70"/><rect x="300" y="225" width="14" height="60"/><rect x="1290" y="215" width="16" height="80"/><rect x="1385" y="220" width="20" height="90"/></g>
+    <rect y="240" width="1440" height="660" fill="url(#grass)"/>
+    <path d="M0 350 355 268V325L0 470Z" fill="#12352a"/><path d="M1440 350 1070 268V325L1440 460Z" fill="#1d4434"/>
+    <rect x="355" y="218" width="718" height="107" fill="#1f4a39"/>
+    <g font-family="Poddle Rounded, sans-serif" font-weight="900" font-size="40" fill="#d9ddd4" text-anchor="middle"><text x="500" y="284">PODDLE</text><text x="715" y="284">PODDLE</text><text x="928" y="284">PODDLE</text></g>
+    <circle cx="608" cy="272" r="9" fill="#e3c534"/><circle cx="822" cy="272" r="9" fill="#e3c534"/>
+    <path d="M545 374H905L1235 775H208Z" fill="#fff"/>
+    <path d="M550 378H722L735 428 510 428Z M728 378H900L941 428 741 428Z" fill="#2f66b3"/>
+    <path d="M507 432H944L1062 522H426Z" fill="#ee8a4a"/>
+    <path d="M423 528H744L775 768 222 768Z M752 528H1066L1222 768 788 768Z" fill="#3569b8"/>
+    <rect x="436" y="392" width="600" height="76" fill="url(#net)"/><rect x="436" y="390" width="600" height="5" fill="#f4f4f4"/><rect x="432" y="384" width="7" height="88" fill="#1b1f24"/><rect x="1033" y="382" width="7" height="90" fill="#1b1f24"/>
+    <g><ellipse cx="750" cy="362" rx="34" ry="6" fill="#0003"/><rect x="728" y="280" width="40" height="64" rx="18" fill="#e6b52c"/><circle cx="748" cy="262" r="21" fill="#f0c9a0"/><path d="M727 258a21 21 0 0 1 42 0q-21-12-42 0Z" fill="#3b2a20"/></g>
+    <circle cx="534" cy="386" r="11" fill="#e8fb2a"/>
+    <g transform="rotate(14 600 560)"><rect x="584" y="488" width="38" height="96" rx="16" fill="#8c1f2c" stroke="#1b1f24" stroke-width="4"/><rect x="596" y="582" width="14" height="40" rx="6" fill="#23272c"/></g>
+    <ellipse cx="700" cy="715" rx="46" ry="12" fill="#0003"/>
+  </svg>
+</div>
+
+<!-- The UI markup is NOT copied here: it is loaded from web/index.html (between UI:BEGIN and UI:END) and driven by the real web/ui.js,
+     so this mock can never drift from the game. Serve the repo root over http (node test/ui-shots/shoot.mjs does). -->
+<div id="ui-root"></div>
+
+<div id="sheet" hidden></div>
+
+<script type="module">
+  // Mock driver: forces each state through the real ui.js API. Nothing here is game logic.
+  const $ = id => document.getElementById(id), qs = new URLSearchParams(location.search), screen = qs.get('screen') || 'title';
+  const SCREENS = ['title', 'lobby', 'lobby-first', 'lobby-bot', 'lobby-ask', 'lobby-courts', 'lobby-courts-full', 'lobby-courts-loading', 'lobby-courts-empty', 'lobby-courts-empty-full', 'lobby-courts-nomatch', 'lobby-courts-down', 'lobby-courts-err', 'lobby-courts-link', 'lobby-courts-many', 'connect', 'calibrate1', 'calibrate2', 'calibrate-error', 'calibrate-settle', 'calibrate-done', 'hud', 'hud-countdown', 'hud-callout', 'hud-point-you', 'hud-point-enemy', 'hud-arrivals', 'serve-prompt', 'hud-airpod-lost', 'hud-stats',
+    'settings', 'settings-paused', 'settings-stats', 'settings-watch', 'hud-paused', 'hold', 'watch', 'watch-split', 'watch-pov', 'watch-point', 'match-win', 'match-voted', 'match-asked', 'match-left', 'match-lose', 'match-forfeit', 'match-watch', 'match-legacy', 'match-nostats', 'server-down', 'game-full', 'hud-ask', 'hud-ask-settings', 'match-ask', 'watch-ask',
+    'tourney-courts', 'tourney-host-empty', 'tourney-host-3', 'tourney-host-ready', 'tourney-host-16', 'tourney-guest', 'tourney-warmfull', 'tourney-banner', 'tourney-banner-host', 'tourney-card', 'tourney-intro', 'tourney-bracket', 'tourney-win', 'tourney-out', 'tourney-champion', 'tourney-champion-watch', 'tourney-ended', 'tourney-match', 'tourney-match-settings', 'tourney-match-qq',
+    'lobby-five', 'lobby-six', 'lobby-ranks', 'hud-emblems',      // trophies (docs/TROPHIES.md 4): the five-tile home (signed out, with a stats server), the six-tile home (signed in), the Ranks page (&tier=1..8&t=trophies&best=, &new=1: no trophies yet), emblems in the score tabs on a plain court
+    'match-trophies', 'stats-road'];      // the trophy row on the ordinary result card (&trophy=up|down|zero|none|unsaved|rankup|divup|rankdown|walkover|matt|easy|day|ceiling|signin|username, &beat=lose, &opp=Matt, &rankup=1 = the ceremony's frame); the Your stats hero with the road (&tier=&t=&div=&best=&bestdiv=&place=, &new=1: no trophies yet, &guest=1: signed out)
+  // extra params: &bg=court|grass (flat ground under the HUD) · &name=<player name> · &opp=<opponent> (try a hostile one) · &idle=1 · &freeze=1
+  if (qs.get('freeze') === '1') document.documentElement.classList.add('freeze');
+  if (screen === 'all') {
+    document.documentElement.classList.add('sheet-root'); document.body.classList.add('sheet'); const sheet = $('sheet'); sheet.hidden = false;
+    for (const s of SCREENS) { const f = document.createElement('figure'); f.innerHTML = `<figcaption>${s}</figcaption><div class="thumb"><iframe src="?screen=${s}&freeze=1" loading="eager"></iframe></div>`; sheet.appendChild(f); }
+    const fit = () => document.querySelectorAll('#sheet .thumb').forEach(t => t.firstChild.style.transform = `scale(${t.clientWidth / 1440})`); fit(); addEventListener('resize', fit);
+  } else {
+    const html = await (await fetch('../web/index.html')).text();
+    $('ui-root').innerHTML = html.slice(html.indexOf('<!-- UI:BEGIN -->'), html.indexOf('<!-- UI:END -->'));
+    // stand-ins for the two live canvases
+    $('camc').outerHTML = '<div class="inset-fill fake-cam"></div>'; $('camwrap').hidden = false;
+    $('pod').outerHTML = '<div class="inset-fill fake-pod"><svg viewBox="0 0 100 160"><rect x="40" y="52" width="20" height="98" rx="10" fill="#f4f6f8" stroke="#c4ced6" stroke-width="3"/><ellipse cx="46" cy="38" rx="30" ry="32" fill="#fbfcfd" stroke="#c4ced6" stroke-width="3"/><circle cx="34" cy="34" r="7" fill="#59636c"/></svg></div>';
+    const me = screen === 'lobby-first' ? '' : qs.get('name') ?? 'Daniel', opp = qs.get('opp') || 'Matt';
+    try { if (me) localStorage.setItem('poddle.name', me); else localStorage.removeItem('poddle.name'); } catch { /* fine */ }      // ui.js reads it as it loads
+    const ui = await import('../web/ui.js'); window.__ui = ui;
+    if (qs.get('bg')) $('stage').classList.add('bg-' + qs.get('bg'));
+    const hud = (a = 7, b = 5, rally = 4) => { $('stage').hidden = false; ui.showScreen(null); ui.setStatus({ airpod: 'ok', game: 'ok', camera: 'ok' }); ui.setRoom('K24M', 'https://poddleball.com/?court=K24M'); ui.setNames({ them: opp, themSub: opp === 'Matt' ? 'Club' : 'Far side' }); ui.setBot(opp === 'Matt' ? 'Club' : null); ui.setScore(a, b); ui.setServe('me'); ui.setRally(rally); ui.setSettings({ sens: 8, airpod: true, stats: false, inRoom: true }); };
+    const watch = (view = 'broadcast', who = '') => { hud(6, 4, 7); $('camwrap').hidden = true; ui.setNames({ me: me || 'Player 1', meSub: '', them: opp, themSub: '' }); ui.setSpectator(true); ui.setWatchers(3); ui.setSettings({ spectator: true }); ui.setView(view, who); };
+    // the court list: open courts (a join seats you), ask rows (one human playing Matt: a join asks them), full courts (the row is Watch). &tour=1 adds a tournament signing up
+    const ROOMS = [{ code: 'KXQ7', players: 1, open: true, ask: false, bot: false, watch: 8, watchers: 0, score: [0, 0], live: false, names: ['Dan', null] },
+      { code: 'M3PD', players: 2, open: false, ask: false, bot: false, watch: 6, watchers: 2, score: [7, 4], live: true, names: ['Ann', 'Ben'] },
+      { code: 'RN2S', players: 2, open: false, ask: false, bot: false, watch: 0, watchers: 8, score: [10, 9], live: true, names: ['Priyanka', 'Sam'] },
+      { code: 'WXYZ', players: 1, open: true, ask: false, bot: true, watch: 8, watchers: 1, score: [0, 0], live: false, names: ['Kim', 'Matt'] },
+      { code: 'KXQ9', players: 1, open: false, ask: true, bot: true, watch: 7, watchers: 1, score: [4, 6], live: true, names: ['Lu', 'Matt'] },
+      { code: 'H4TT', players: 1, open: true, ask: false, bot: false, watch: 8, watchers: 0, score: [0, 0], live: false, names: ['Oliver', null] },
+      { code: 'B7QE', players: 1, open: true, ask: false, bot: false, watch: 8, watchers: 3, score: [0, 0], live: false, names: ['Mei', null] },
+      { code: 'Z9KP', players: 1, open: false, ask: true, bot: true, watch: 8, watchers: 0, score: [2, 1], live: true, names: ['Rafael', 'Matt'] },
+      { code: 'CQ3N', players: 2, open: false, ask: false, bot: false, watch: 8, watchers: 0, score: [0, 0], live: false, names: ['Jo', 'Tia'] },
+      { code: 'EV5R', players: 1, open: true, ask: false, bot: false, watch: 8, watchers: 0, score: [0, 0], live: false, names: ['Noor', null] },
+      { code: 'GJ2W', players: 1, open: true, ask: false, bot: true, watch: 8, watchers: 0, score: [0, 0], live: false, names: ['Ivy', 'Matt'] }];
+    const TOURS = qs.get('tour') === '1' ? [{ code: 'T8MX', host: 'Daniel', n: 5, max: 16 }] : [];      // (tourney-courts adds it too)
+    const lobby = (view = 'home', rooms = ROOMS) => { $('stage').hidden = false; ui.showScreen('lobby'); ui.lobbyView(view); if (rooms) ui.lobbyRooms(rooms, 5, TOURS); };
+    // trophies (docs/TROPHIES.md 4): the home tiles show where the server keeps stats (web/profile.js unhides them and calls tilesFit); the hero draws from a ladder like /api/stats sends
+    const TIER = Math.min(8, Math.max(1, +qs.get('tier') || 2)), TROPH = qs.get('t') != null ? +qs.get('t') : [40, 240, 372, 500, 660, 800, 950, 1100][TIER - 1], DIV = +qs.get('div') || (TIER === 8 ? 1 : 1 + Math.min(2, Math.floor((TROPH - [0, 150, 300, 450, 600, 750, 900, 1050][TIER - 1]) / 50)));      // &div= overrides the division the count implies
+    const LADDER = qs.get('new') ? null : { tier: TIER, div: DIV, trophies: TROPH, best: Math.max(TIER, +qs.get('best') || 0), bestDiv: +qs.get('bestdiv') || (+qs.get('best') > TIER ? 3 : DIV), bestAt: Date.UTC(2026, 9, 2), place: +qs.get('place') || null };
+    const five = () => { for (const id of ['btn-profile', 'btn-leaderboard']) $(id).hidden = false; ui.tilesFit(); };      // signed out with a stats server: Quick play alone in the hero row
+    const six = () => { for (const id of ['btn-friends', 'btn-profile', 'btn-leaderboard']) $(id).hidden = false; ui.tilesFit(); };      // signed in: Friends beside it
+    const stats = () => { lobby('profile'); five(); ui.rankCrest(LADDER, qs.get('guest') !== '1'); if (LADDER && LADDER.place) { $('st-place').hidden = false; $('st-place-n').textContent = '#' + LADDER.place; } };      // the place pill is web/profile.js drawPlace's (the mock has no profile.js)
+    const OPP_NAME = opp === 'Matt' ? 'Matt' : opp, RANKS = [{ tier: TIER, div: 2 }, opp === 'Matt' ? null : { tier: Math.min(8, TIER + 1), div: 1 }];
+    // the trophy row: the profile message's trophies as the server sends them (docs/TROPHIES.md 3.6)
+    const tRes = o => ({ saved: true, won: true, delta: 30, trophies: 270, tier: 2, div: 3, tierWas: 2, divWas: 2, floorHeld: false, counted: true, why: [], ...o });
+    const TROPHY = { up: tRes({}), down: tRes({ won: false, delta: -20, trophies: 220, div: 2 }), zero: tRes({ won: false, delta: 0, trophies: 150, div: 1, divWas: 1, floorHeld: true }), none: tRes({ won: false, counted: false, delta: 0, trophies: 240, why: ['left_early'] }),
+      unsaved: tRes({ saved: false, delta: 0, trophies: 240 }), rankup: tRes({ delta: 30, trophies: 312, tier: 3, div: 1, tierWas: 2, divWas: 3 }), divup: tRes({ delta: 30, trophies: 262, div: 3, divWas: 2 }),
+      rankdown: tRes({ won: false, delta: -26, trophies: 590, tier: 4, div: 3, tierWas: 5, divWas: 1 }), walkover: tRes({ delta: 30, trophies: 270, forfeit: true }), stayer: tRes({ delta: 0, trophies: 240, why: ['left_early'] }),
+      matt: tRes({ matt: true, delta: 8, trophies: 248, div: 2 }), easy: tRes({ matt: true, delta: 0, trophies: 240, div: 2, limit: 'easy' }), day: tRes({ matt: true, delta: 0, trophies: 240, div: 2, limit: 'day' }), ceiling: tRes({ matt: true, delta: 0, trophies: 899, tier: 6, div: 3, tierWas: 6, divWas: 3, limit: 'ceiling' }),
+      signin: { none: 'signin' }, username: { none: 'username' } };
+    const tCard = (o, tr) => { hud(o.me, o.them, 0); ui.setBot(opp === 'Matt' ? 'Club' : null); ui.setNames({ them: OPP_NAME, themSub: opp === 'Matt' ? 'Club' : 'Far side', reg: [false, opp !== 'Matt'], rank: RANKS }); ui.setServe(null); ui.matchResult({ nameThem: OPP_NAME, reg: [false, opp !== 'Matt'], rank: RANKS, vote: true, ...o }); ui.rematch({ name: OPP_NAME, left: 20 }); const t = qs.get('trophy') || tr; if (t && TROPHY[t]) ui.trophyRow(TROPHY[t]); if (qs.get('rankup') === '1') ui.rankUp({ tier: 3, div: 1, kind: 'rank' }); };
+    const courts = (rooms = ROOMS) => { lobby('courts', rooms); if (qs.get('q')) { const i = $('court-search'); i.value = qs.get('q'); i.dispatchEvent(new Event('input')); } };
+    const tab = f => $('court-seg').querySelector(`[data-filter="${f}"]`).click();
+    const tab0 = () => { try { localStorage.removeItem('poddle.courts'); } catch { /* fine */ } };
+    const result = (o, votes) => { hud(o.me, o.them, 0); ui.setServe(null); ui.matchResult({ nameThem: opp, ...o }); if (votes) ui.rematch({ name: opp, ...votes }); };
+    const cal = (e, o) => { ui.setStatus({ airpod: 'ok', game: 'ok', camera: 'ok' }); ui.showScreen('calibrate'); ui.calibration(e, o); };
+    // tournaments (docs/COURTS-TOURNEY.md 4.6): a snapshot as the server sends it. &n= players, &you=through|out|watching, &next=1 (the break between rounds), &why= (ended)
+    const TN = ['Daniel', 'Kim', 'Ben', 'Sam', 'Ana', 'Priyanka', 'Lu', 'Oliver', 'Mei', 'Rafael', 'Noor', 'Ivy', 'Jo', 'Tia', 'Ada', 'Bo'], LINK = 'https://poddleball.com/?court=K24M';
+    const tsnap = (n, o = {}) => ({ type: 'tour', code: 'K24M', phase: 'reg', min: 4, max: 16, n, host: 'Daniel', win: 7, final: 11, rounds: [], next: null, champ: null, ...o,
+      you: { id: 1, host: true, out: false, viewer: false, warm: 'off', ...o.you }, players: TN.slice(0, n).map((name, i) => ({ id: i + 1, name, host: i === 0, out: false, left: false, on: i !== o.off })) });
+    const P = i => ({ id: i + 1, name: TN[i], bot: false }), M = { id: null, name: 'Matt', bot: true }, TBD = { id: null, name: null, bot: false };
+    const mt = (n, a, b, o = {}) => ({ n, a, b, room: null, score: [0, 0], live: false, w: null, forfeit: false, watchers: 0, ...o });
+    const tbd = k => Array.from({ length: k }, (_, i) => mt(i + 1, TBD, TBD));
+    function bracketSnap(n, you, next) {      // 5 players: Round 1 (3, one Matt), Semifinal, Final. 16: Round 1, Quarterfinal, Semifinal, Final
+      const r1 = n === 5 ? [mt(1, P(0), P(1), { w: 'a', score: [7, 4] }), next ? mt(2, P(2), P(3), { w: 'b', score: [9, 11], forfeit: false }) : mt(2, P(2), P(3), { live: true, room: 'QW7R', score: [5, 3], watchers: 2 }), mt(3, P(4), M, { w: 'b', score: [5, 7] })]
+        : Array.from({ length: 8 }, (_, i) => i === 6 && !next ? mt(7, P(12), P(13), { live: true, room: 'QW7R', score: [4, 6], watchers: 3 }) : i === 7 && !next ? mt(8, P(14), P(15), { live: true, room: 'HN3D', score: [2, 2] }) : mt(i + 1, P(i * 2), P(i * 2 + 1), { w: i % 3 === 1 ? 'b' : 'a', score: i % 3 === 1 ? [3, 7] : i === 4 ? [7, 0] : [7, 5], forfeit: i === 4 }));
+      const rounds = n === 5 ? [{ name: 'Round 1', target: 7, matches: r1 }, { name: 'Semifinal', target: 7, matches: tbd(2) }, { name: 'Final', target: 11, matches: tbd(1) }]
+        : [{ name: 'Round 1', target: 7, matches: r1 }, { name: 'Quarterfinal', target: 7, matches: tbd(4) }, { name: 'Semifinal', target: 7, matches: tbd(2) }, { name: 'Final', target: 11, matches: tbd(1) }];
+      const yid = you === 'out' ? 2 : you === 'watching' ? null : 1;
+      return tsnap(n, { phase: 'play', rounds, next: next ? { what: 'round', in: 6 } : null, you: { id: yid, host: yid === 1, out: you === 'out', viewer: you === 'watching', warm: 'off' } });
+    }
+    const CHAMP = { id: 1, name: 'Daniel', bot: false, path: [{ round: 'Round 1', vs: 'Kim', bot: false, score: [7, 4], forfeit: false }, { round: 'Semifinal', vs: 'Matt', bot: true, score: [7, 5], forfeit: false }, { round: 'Final', vs: 'Priyanka', bot: false, score: [11, 9], forfeit: false }] };
+    const tourLobby = (snap, view) => { $('stage').hidden = false; ui.showScreen('lobby'); ui.setTour(snap, { link: qs.get('local') === '1' ? '' : LINK }); ui.lobbyView(view); };
+    const tmatch = () => { hud(3, 2, 0); ui.setServe('me'); ui.setNames({ them: 'Ben', themSub: 'Far side' }); ui.setBot(null); ui.setSettings({ canPause: false, tourMatch: true, forfeit: true });
+      ui.setTour(tsnap(4, { phase: 'play', rounds: [{ name: 'Semifinal', target: 7, matches: [mt(1, P(0), P(2), { live: true, room: 'QW7R', score: [3, 2] }), mt(2, P(1), P(3), { live: true, room: 'HN3D', score: [1, 4] })] }, { name: 'Final', target: 11, matches: tbd(1) }] }), { link: LINK }); ui.tourCourt('match'); };
+    addEventListener('keydown', e => { if ((e.key === 'Escape' || e.key.toLowerCase() === 't') && ui.tourCard()) ui.tourCard(false); });      // main.js's Esc / T on the open card (esc(), tourKey()): the mock has no main.js
+    const warm = snap => { hud(0, 0, 0); ui.setServe(null); ui.setNames({ them: 'Matt', themSub: 'Tour' }); ui.setBot('Tour'); ui.setTour(snap, { link: LINK }); ui.tourCourt('warm'); };
+    const R = {
+      'title': () => { $('stage').hidden = false; ui.showScreen('title'); },
+      'lobby': () => lobby(), 'lobby-first': () => lobby(), 'lobby-bot': () => lobby('bot'),
+      'lobby-ask': () => { lobby(); ui.askWatch('M3PD'); },
+      'lobby-courts': () => { courts(); tab('open'); },
+      'lobby-courts-full': () => { courts(); tab('full'); },
+      'lobby-courts-loading': () => { tab0(); lobby('courts', null); },
+      'lobby-courts-empty': () => { courts([ROOMS[1], ROOMS[2]]); tab('open'); },
+      'lobby-courts-empty-full': () => { courts(ROOMS.filter(r => r.open !== false || r.ask)); tab('full'); },      // nothing to watch: the Full tab's own empty line
+      'lobby-courts-nomatch': () => { if (!qs.get('q')) qs.set('q', 'ZZ'); courts([...ROOMS, { code: 'ZZ4Q', players: 2, open: false, ask: false, bot: false, watch: 8, watchers: 0, score: [3, 5], live: true, names: ['Ada', 'Bo'] }]); tab('open'); },      // one Full court matches ZZ: the '1 in Full' switch shows
+      'lobby-courts-down': () => { courts(); tab('open'); ui.lobbyLink(false); },
+      'lobby-courts-err': () => { courts(); tab('open'); ui.lobbyView('courts', { code: 'QQ4R' }); ui.codeError('Court not found'); },
+      'lobby-courts-link': () => { courts(); tab('open'); ui.lobbyView('courts', { code: 'M3PD', watch: true }); },
+      'lobby-courts-many': () => { courts([...Array(42)].map((_, i) => ({ code: 'CDEFGHJKMN'[i % 10] + 'PQRSTUVWXY'[(i / 10) | 0] + '2' + '3456789ABC'[i % 10], players: i % 3 ? 1 : 2, open: i % 3 === 1, ask: i % 3 === 2, bot: i % 3 === 2, watch: 8, watchers: i % 4, score: [i % 11, (i * 3) % 11], live: true, names: ['Player' + (i + 1), i % 3 === 2 ? 'Matt' : 'Guest' + i] }))); tab('open'); },
+      'connect': () => { ui.setStatus({ airpod: 'wait', game: 'ok', camera: 'wait' }); ui.showScreen('connect'); },
+      'calibrate1': () => cal({ stage: 'hold', progress: .62, ok: true, msg: 'Hold it like a paddle, pointed at the screen. Keep still.' }),
+      'calibrate2': () => cal({ stage: 'tilt', progress: .4, ok: true, msg: 'Now tip the front of the AirPod up.' }),
+      'calibrate-error': () => qs.get('err') === 'twist' ? cal({ stage: 'tilt', progress: 0, ok: false, msg: 'That was a twist. Level out, then tip it straight up.' }) : cal({ stage: 'hold', progress: 0, ok: false, msg: 'You moved. Hold still.' }),
+      'calibrate-done': () => cal({ stage: 'tilt', progress: 1, ok: true, msg: 'All set' }),
+      'calibrate-settle': () => cal({ stage: 'tilt', progress: .5, ok: true, msg: 'Good. Now hold it how you’ll play.' }),
+      'hud': () => hud(),
+      'hud-stats': () => { hud(); ui.toggle('dev'); ui.setStat('pw', '12.4'); ui.setStat('px', '0.8'); ui.setStat('py', '1.1'); ui.setStat('pkmax', '31.2'); ui.setStat('sw', 14); ui.setStat('pkavg', '19.6'); ui.setStat('pklist', '22 (96°) · × (31°) · 30 (128°) · 17 (74°) · 26 (110°)'); },
+      'hud-countdown': () => { hud(0, 0, 0); ui.setServe(null); ui.countdown(+qs.get('left') || 3); },      // the count into a match: no score, no rally, nothing in play yet
+      'hud-callout': () => { hud(7, 5, 5); ui.callout(qs.get('kind') || 'smash', qs.get('them') === '1'); },
+      'hud-point-you': () => { hud(8, 5, 0); ui.pointBanner(true); },
+      'hud-arrivals': () => { hud(0, 0, 0); ui.setServe(null); ui.setWatchers(2); ui.joinBanner(opp); ui.watcherNote('Sam'); ui.watcherNote('Priyanka'); },      // who just arrived: the centre banner for a player, the left cards for the stands
+      'hud-point-enemy': () => { hud(7, 6, 0); ui.pointBanner(false); },
+      'serve-prompt': () => { hud(7, 5, 0); ui.toast('Your serve', 1e6); },
+      'hud-airpod-lost': () => { hud(); ui.setStatus({ airpod: 'bad' }); ui.toast('AirPod signal lost', 1e6); },
+      'settings': () => { hud(); ui.setSettings({ canPause: false }); ui.settings(true); },                                   // against a human: live behind it, the can't-pause note
+      'settings-paused': () => { hud(); ui.setPaused(true); ui.settings(true); },                                              // against Matt: blurred, "Paused"
+      'settings-stats': () => { hud(); ui.show('dev', true); ui.setSettings({ stats: true }); ui.setStat('pw', '12.4'); ui.setStat('pkmax', '31.2'); ui.setStat('pklist', '22 (96°) · × (31°) · 30 (128°) · 17 (74°) · 26 (110°)'); ui.settings(true); },      // the stats step out from under the card
+      'settings-watch': () => { watch(); ui.settings(true); },
+      'hud-paused': () => { watch(); ui.setPaused(true); },                                                                   // the tag a spectator sees
+      'hold': () => { hud(); ui.setServe(null); ui.hold(opp, 12); },
+      'watch': () => watch(), 'watch-split': () => watch('split'), 'watch-pov': () => watch('pov', opp),
+      'watch-point': () => { watch(); ui.pointBanner(null, opp, 1); },
+      'match-win': () => result({ won: true, me: 11, them: 8, stats: { rally: 14, smashes: 3, run: 5 } }, { mine: null, theirs: null, left: 20 }),
+      'match-voted': () => result({ won: true, me: 11, them: 8 }, { mine: true, theirs: null, left: 14 }),
+      'match-asked': () => result({ won: false, me: 9, them: 11 }, { mine: null, theirs: true, left: 17 }),
+      'match-left': () => result({ won: true, me: 11, them: 8 }, { mine: true, theirs: false, left: 9 }),
+      'match-lose': () => result({ won: false, me: 9, them: 11, stats: { rally: 7, smashes: 0, run: 4 } }, { left: 20 }),
+      'match-forfeit': () => result({ won: true, me: 6, them: 4, forfeit: true }, { left: 20 }),
+      'match-watch': () => { watch(); ui.matchResult({ won: false, me: 9, them: 11, nameMe: me, nameThem: opp, role: 'spectator', stats: { rally: 12, smashes: 4, run: 3 } }); ui.rematch({ left: 16 }); },
+      'match-nostats': () => result({ won: true, me: 11, them: 8, stats: null }, { mine: null, theirs: null, left: 20 }),      // main.js did not see every point: no stats row
+      'match-legacy': () => { hud(11, 8, 0); ui.setServe(null); ui.matchResult(true, 11, 8, opp); },                           // the old positional call: no vote
+      'server-down': () => { hud(); ui.setStatus({ game: 'bad' }); ui.setServerAddress('ws://localhost:8080'); ui.showOverlay('server-down'); },
+      'game-full': () => { hud(); ui.showOverlay('game-full'); },
+      // asking to play: the player's corner card (over the court, over the paused settings card, over the result card), the spectator's button
+      'hud-ask': () => { hud(); ui.askCard({ name: qs.get('asker') || 'Sam', left: 10 }); },
+      'hud-ask-settings': () => { hud(); ui.setPaused(true); ui.settings(true); ui.askCard({ name: 'Sam', left: 7 }); },
+      'match-ask': () => { result({ won: true, me: 11, them: 8 }, { mine: null, theirs: null, left: 20 }); ui.askCard({ name: 'Sam', left: 4 }); },
+      'tourney-courts': () => { TOURS.push({ code: 'T8MX', host: 'Daniel', n: 5, max: 16 }); courts(); tab('open'); },
+      'tourney-host-empty': () => tourLobby(tsnap(1), 'tour'),
+      'tourney-host-3': () => tourLobby(tsnap(3, { off: qs.get('off') ? 2 : undefined }), 'tour'),
+      'tourney-host-ready': () => tourLobby(tsnap(+qs.get('n') || 5), 'tour'),
+      'tourney-host-16': () => tourLobby(tsnap(16), 'tour'),
+      'tourney-guest': () => tourLobby(tsnap(+qs.get('n') || 5, { you: { id: 3, host: false, warm: 'off' } }), 'tour'),
+      'tourney-warmfull': () => tourLobby(tsnap(3, { you: { id: 3, host: false, warm: 'full' } }), 'tour'),
+      'tourney-banner': () => { warm(tsnap(+qs.get('n') || 5, { you: { id: 3, host: false, warm: 'on' } })); ui.tourNote('Priyanka'); },
+      'tourney-banner-host': () => warm(tsnap(+qs.get('n') || 5, { you: { id: 1, host: true, warm: 'on' } })),
+      'tourney-card': () => { warm(tsnap(+qs.get('n') || 5, { you: { id: 1, host: true, warm: 'on' } })); ui.setPaused(true); ui.tourCard(true); },
+      'tourney-intro': () => { hud(0, 0, 0); ui.tourVs({ round: 2, name: qs.get('final') ? 'Final' : 'Quarterfinal', n: 2, of: qs.get('final') ? 1 : 4, vs: qs.get('bot') ? { name: 'Matt', bot: true } : { name: 'Kim', bot: false }, target: qs.get('final') ? 11 : 7, final: !!qs.get('final'), at: 4, side: 0 }); },
+      'tourney-bracket': () => tourLobby(bracketSnap(+qs.get('n') === 16 ? 16 : 5, qs.get('you') || 'through', qs.get('next') === '1'), 'bracket'),
+      'tourney-win': () => { hud(7, 4, 0); ui.setServe(null); ui.matchResult({ won: true, me: 7, them: 4, nameThem: 'Kim', stats: { rally: 10, smashes: 2, run: 4 }, tour: { round: 'Quarterfinal', next: 'Semifinal', final: false, gap: 6 } }); },
+      'tourney-out': () => { hud(4, 7, 0); ui.setServe(null); ui.matchResult({ won: false, me: 4, them: 7, nameThem: 'Kim', stats: { rally: 8, smashes: 1, run: 3 }, tour: { round: 'Quarterfinal', next: 'Semifinal', final: false, gap: 6 } }); },
+      'tourney-champion': () => { hud(11, 9, 0); ui.setServe(null); ui.champion(CHAMP, 1); },
+      'tourney-champion-watch': () => { hud(11, 9, 0); ui.setServe(null); ui.champion(qs.get('matt') ? { ...CHAMP, id: null, name: 'Matt', bot: true } : CHAMP, 5); },
+      'tourney-ended': () => { lobby(); ui.tourEnded(qs.get('why') || 'restart'); },
+      'tourney-match': () => tmatch(),                                                                                        // in a match (4.6 item 7): the pill names the round and who, no court pill, no 1 2 3 4
+      'tourney-match-settings': () => { tmatch(); ui.settings(true); },                                                         // Forfeit, and 'Tournament matches can't pause'
+      'tourney-match-qq': () => { tmatch(); ui.toast('Press Q again to forfeit', 1e6); },
+      'lobby-five': () => { lobby(); five(); }, 'lobby-six': () => { lobby(); six(); },
+      'lobby-ranks': () => { lobby(); five(); ui.rankCrest(LADDER, true); ui.lobbyView('ranks'); },      // every medal (the Ranks page), the player's own rank ringed (&new=1: none)
+      'hud-emblems': () => { hud(3, 2, 0); ui.setBot(null); ui.setNames({ them: opp === 'Matt' ? 'Priyanka' : opp, themSub: 'Far side', reg: [false, true], rank: [{ tier: TIER, div: 2 }, { tier: Math.min(8, TIER + 1), div: 1 }] }); ui.setSettings({ canPause: false, forfeit: true }); },      // a plain court: emblems beside both names (yours, theirs with a badge)
+      'match-trophies': () => { const lose = qs.get('beat') === 'lose', w = qs.get('trophy') === 'walkover'; tCard({ won: !lose, me: lose ? 8 : 11, them: lose ? 11 : 8, forfeit: w, stats: w ? null : { rally: 12, smashes: 2, run: 4 } }, lose ? 'down' : 'up'); },      // the ordinary card with its trophy row (&trophy=, &beat=lose, &opp=Matt, &rankup=1)
+      'stats-road': () => stats(),      // Your stats: the crest, the next line, the road, the keep line (&tier=&t=&best=&place=, &new=1, &guest=1)
+      'watch-ask': () => { watch(); ui.setNames({ me: 'Lu', meSub: '', them: 'Matt', themSub: 'Club' }); ui.showAsk(true); const st = qs.get('s') || 'idle'; if (st !== 'idle') ui.askPlay({ s: st, left: st === 'sent' ? 9 : 8, busy: qs.get('busy') === '1' }); const why = st === 'no' ? 'Lu said no' : st === 'expired' ? 'No answer from Lu' : st === 'wait' && qs.get('busy') === '1' ? 'Someone else asked first' : ''; if (why) ui.toast(why, 600000); },      // main.js's toast says why
+    };
+    (R[screen] || R.title)();
+    if (qs.get('idle') === '1') for (const id of ['keys', 'views']) $(id).classList.add('is-idle');
+    document.title = 'ready ' + screen;
+  }
+</script>

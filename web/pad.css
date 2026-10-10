@@ -1,0 +1,151 @@
+/* The phone's page (pad.html): a paddle has nothing to read while it is swung, so one big state at a time. Same tokens as the game. */
+@font-face{font-family:"Poddle Rounded";font-weight:500;font-style:normal;font-display:swap;src:url(vendor/fonts/mplus-rounded-1c-500.woff2) format("woff2")}
+@font-face{font-family:"Poddle Rounded";font-weight:800;font-style:normal;font-display:swap;src:url(vendor/fonts/mplus-rounded-1c-800.woff2) format("woff2")}
+@font-face{font-family:"Poddle Rounded";font-weight:900;font-style:normal;font-display:swap;src:url(vendor/fonts/mplus-rounded-1c-900.woff2) format("woff2")}
+:root{--ink:#555e67;--ink-strong:#39434d;--ink-soft:#65717b;--bg:#dfeef6;--line:#34beed;--line-deep:#1a9fd0;--line-soft:#a9e0f6;--link:#0f7aa6;--ball:#e8fb2a;--ball-deep:#cfae00;--good:#3ecf72;--good-deep:#13803f;--warn:#ffb534;
+  --ease-out:cubic-bezier(.22,1,.36,1);--ease-soft:cubic-bezier(.45,0,.25,1);--ease-bounce:cubic-bezier(.34,1.56,.64,1);--d-fast:160ms;--d-med:320ms;      /* same motion tokens as ui.css */
+  --font:"Poddle Rounded",ui-rounded,"SF Pro Rounded","Arial Rounded MT Bold","Nunito","Helvetica Neue",Arial,sans-serif;color-scheme:light}
+*,*::before,*::after{box-sizing:border-box}
+/* Nothing on the page is selectable (a drag, a double-click or a long press mid-swing lit up text) EXCEPT what you type and the codes:
+   a code is meant to be copied, so one click takes all of it. NOTES 79. */
+html{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+input,textarea,select,[contenteditable]{-webkit-user-select:text;user-select:text;-webkit-touch-callout:default}
+#start-code{-webkit-user-select:all;user-select:all;-webkit-touch-callout:default;white-space:nowrap}
+html,body{height:100%}
+body{margin:0;color:var(--ink);background:var(--bg) linear-gradient(180deg,#f7fbfd 0,#eaf3f8 45%,var(--bg) 100%) fixed;font:500 1.0625rem/1.5 var(--font);-webkit-font-smoothing:antialiased;
+  -webkit-text-size-adjust:100%;touch-action:manipulation;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+main{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;padding:max(1.5rem,env(safe-area-inset-top)) max(1.5rem,env(safe-area-inset-right)) max(1.5rem,env(safe-area-inset-bottom)) max(1.5rem,env(safe-area-inset-left));text-align:center}
+.logo-mark{display:inline-flex;align-items:center;margin:0 0 .5rem;font-size:2.75rem;font-weight:900;line-height:1;color:var(--ink-strong);filter:drop-shadow(0 .05em 0 rgba(90,150,185,.28))}
+.logo-ball{display:inline-block;width:.62em;height:.62em;margin:.16em .035em 0;border-radius:50%;background:radial-gradient(circle at 50% 50%,var(--ball-deep) 0 .047em,transparent .052em),radial-gradient(circle at 50.0% 23.0%,var(--ball-deep) 0 .047em,transparent .052em),radial-gradient(circle at 73.4% 36.5%,var(--ball-deep) 0 .047em,transparent .052em),radial-gradient(circle at 73.4% 63.5%,var(--ball-deep) 0 .047em,transparent .052em),radial-gradient(circle at 50.0% 77.0%,var(--ball-deep) 0 .047em,transparent .052em),radial-gradient(circle at 26.6% 63.5%,var(--ball-deep) 0 .047em,transparent .052em),radial-gradient(circle at 26.6% 36.5%,var(--ball-deep) 0 .047em,transparent .052em),radial-gradient(circle at 34% 28%,#fbffd6,var(--ball) 58%,#ffe01a 100%);box-shadow:inset 0 -.04em .08em rgba(220,180,0,.5),0 .03em .06em rgba(40,80,110,.25)}
+.view{display:none;flex-direction:column;align-items:center;gap:1rem;width:100%;max-width:24rem}
+body[data-view="code"] [data-name="code"],body[data-view="start"] [data-name="start"],body[data-view="live"] [data-name="live"],body[data-view="nomotion"] [data-name="nomotion"],body[data-view="denied"] [data-name="denied"],body[data-view="done"] [data-name="done"]{display:flex}
+h2{margin:0;font-size:1.625rem;font-weight:900;line-height:1.2;color:var(--ink-strong)}
+p{margin:0}
+b{font-weight:800;color:var(--ink-strong)}
+.note{font-size:.9375rem;color:var(--ink-soft);min-height:1.4em}
+[data-name="live"] .note:empty{display:none}      /* live-stats and an unset live-note: no reserved line or flex gap (live-note is set once at load) */
+[data-name="live"] .row + .note{margin-top:-.25rem}      /* the hold caption sits with the buttons it describes */
+.legal{font-size:.8125rem;line-height:1.4;color:var(--ink-soft);max-width:20rem} .legal a{font-weight:700}      /* the Terms and Privacy links, under Start: small, before the motion prompt (web/terms.html) */
+a{color:var(--link);font-weight:800}
+.art{width:12rem;height:auto}
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:3.25rem;padding:0 2rem;border-radius:999px;border:.1875rem solid var(--line);background:linear-gradient(180deg,#fff 0%,#f7fbfd 47%,#e3eef4 53%,#edf5f9 100%);
+  color:var(--ink-strong);font:800 1.125rem/1 var(--font);letter-spacing:.02em;box-shadow:0 .125rem 0 rgba(90,150,185,.22),0 .25rem .625rem rgba(40,80,110,.12);cursor:pointer;
+  outline:.1875rem solid transparent;outline-offset:.5rem;transition:transform var(--d-fast) var(--ease-bounce),background-color var(--d-fast) linear,border-color .2s linear,outline-color .2s linear,outline-offset .24s var(--ease-out)}      /* press springs back; focus ring tightens in */
+.btn:active{transform:translateY(.125rem) scale(.97);box-shadow:0 0 0 rgba(0,0,0,0);transition-duration:60ms}      /* in fast, out on the bounce */
+@media (hover:hover){.btn:hover{border-color:var(--line);transform:translateY(-.0625rem)} .btn:active{transform:translateY(.125rem) scale(.97)}}      /* a laptop tester; :active re-stated so the press wins */
+input:focus-visible{outline:.1875rem solid var(--line);outline-offset:.1875rem}
+.btn:focus-visible{outline-color:var(--line);outline-offset:.1875rem}
+.btn-xl{min-height:4.5rem;padding:0 3.5rem;font-size:1.5rem}
+.btn-sm{min-height:2.75rem;padding:0 1.25rem;font-size:1rem}
+.row{display:flex;gap:.75rem;flex-wrap:wrap;justify-content:center;margin-top:.5rem}
+form{display:flex;flex-direction:column;align-items:center;gap:1rem;width:100%}
+input{width:100%;max-width:16rem;height:4rem;border-radius:1rem;border:.1875rem solid var(--line-soft);background:#fff;color:var(--ink-strong);font:900 2rem/1 var(--font);letter-spacing:.25em;text-align:center;text-transform:uppercase;-webkit-user-select:text;user-select:text}
+input::placeholder{color:#c3dbe8}
+/* the code box: P- is printed in it, you type the four after it (NOTES 81). The box is the label; the input inside it is bare */
+.code-field{display:flex;align-items:center;justify-content:center;gap:.125em;width:100%;max-width:16rem;height:4rem;border-radius:1rem;border:.1875rem solid var(--line-soft);background:#fff;font:900 2rem/1 var(--font);letter-spacing:.25em;cursor:text;padding-left:.5em}
+.code-field{outline:.1875rem solid transparent;outline-offset:.5rem;transition:outline-color .2s linear,outline-offset .24s var(--ease-out)}      /* the ring tightens onto the box */
+.code-field:focus-within{outline-color:var(--line);outline-offset:.1875rem}
+@media (forced-colors:active){.btn,.code-field{outline-style:none} .btn:focus-visible,.code-field:focus-within{outline-style:solid}}      /* the system colours a transparent outline in: no ring at rest */
+.code-pre{color:#9dbccd}
+.code-field input{width:4em;max-width:none;height:100%;padding:0;border:0;border-radius:0;background:none;text-align:left;outline:0}
+/* the one thing worth a glance mid-rally: how hard that swing was, and whether the link is up */
+.ring{position:relative;display:grid;place-items:center;width:11rem;height:11rem;border-radius:50%;border:.375rem solid var(--line-soft);background:#fff;overflow:hidden;box-shadow:0 .1875rem 0 rgba(90,150,185,.25),0 .5rem 1rem rgba(40,80,110,.13)}
+.ring-fill{position:absolute;left:0;right:0;bottom:0;height:100%;transform:scaleY(0);transform-origin:bottom;transition:transform .1s linear;background:linear-gradient(180deg,#bfeaff,var(--line));opacity:.55}      /* pad.js sets scaleY at 10 Hz: compositor-only, the steps blend into a smooth sink */
+.ring b{position:relative;font-size:1.5rem;font-weight:900}
+body[data-link="on"] .ring{border-color:var(--good)}
+body[data-link="wait"] .ring{border-color:var(--warn)}
+.btn-hold{position:relative;overflow:hidden;touch-action:none}
+.btn-hold::before{content:"";position:absolute;inset:0;background:var(--line-soft);transform:scaleX(0);transform-origin:left;opacity:.7;transition:transform .18s var(--ease-out)}      /* let go early: a quick drain, not a snap */
+.btn-hold.is-held::before{transform:scaleX(1);transition:transform .7s linear}
+.btn-hold.is-done{border-color:var(--good)}
+.btn-hold{isolation:isolate}.btn-hold::before{z-index:-1}
+/* The X that ends the session: low and down the MIDDLE, never in a corner — a hand wrapped round the phone rests on the
+   corners, and this must not sit under a palm all rally. Pinned near the bottom (clear of the home bar) so it is in the
+   same place on every phone, with the live view padded to match so nothing is ever under it. 2.75rem: a real target. */
+.btn-x{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(2.75rem + env(safe-area-inset-bottom));width:2.75rem;height:2.75rem;display:grid;place-items:center;padding:0;border-radius:50%;border:.125rem solid var(--line-soft);background:transparent;color:var(--ink-soft);z-index:5;transition:border-color .2s linear,color .2s linear}
+[data-name="live"]{padding-bottom:8rem}
+/* A short phone: tighten the live view so everything, the X included, still fits without scrolling. */
+@media (max-height:760px){[data-name="live"]{gap:.6rem;padding-bottom:7.75rem}[data-name="live"] .ring{width:8.5rem;height:8.5rem}[data-name="live"] .ring b{font-size:1.25rem}}
+/* Shorter than the live view itself (a phone turned sideways): there is no room to hold a strip at the bottom, and pinning
+   the X there would drop it on the Calibrate again / Recentre row. It goes back into the flow, last, and the page scrolls
+   to it — as this page already did at that height. */
+@media (max-height:520px){.btn-x{position:relative;transform:none;margin:1.75rem auto 1rem}[data-name="live"]{padding-bottom:0}}
+.btn-x svg{width:1.15rem;height:1.15rem;fill:none;stroke:currentColor;stroke-width:2.5;stroke-linecap:round}
+/* Holding the X turns a ring, so the wait reads as progress instead of as nothing happening (NOTES 67, the gap in 70).
+   .btn-hold's own indicator is a left-to-right bar — on a round button that reads as a smudge, so the X opts out of it.
+   The ring stands well clear of the button — 112 px round a 44 px button, so 34 px of daylight the whole way round —
+   because a thumb covers the button while you hold it. The point is to watch it turn AROUND your thumb, not under it,
+   so the gap has to beat a thumb's width, not just be visible. The button sits 2.75rem up to let the ring's bottom
+   clear the screen edge, and the live view reserves 8rem so the ring's top half never lands on the notes.
+   Released: no transition, so it snaps back rather than slowly unwinding. */
+.btn-x.btn-hold{overflow:visible} .btn-x.btn-hold::before{display:none}
+.btn-x .hold-ring{position:absolute;inset:-2.25rem;width:auto;height:auto;overflow:visible;pointer-events:none;transform:rotate(-90deg)}
+.btn-x .hold-ring circle{fill:none;stroke-width:1.8;stroke-linecap:round;transition:none}
+.btn-x .hold-track{stroke:var(--line-soft);opacity:0}                                   /* the groove it runs in: only while held, so nothing rings the button at rest */
+.btn-x .hold-arc{stroke:var(--line);stroke-dasharray:138.2;stroke-dashoffset:138.2}
+.btn-x.is-held .hold-track{opacity:.4}
+.btn-x .hold-ring .hold-track{transition:opacity .2s var(--ease-out)}      /* (0,3,0) beats the transition:none above: only the faint groove fades, the arc still snaps */
+.btn-x > svg:not(.hold-ring){transition:scale var(--d-fast) var(--ease-bounce)} .btn-x.is-held > svg:not(.hold-ring){scale:.82}      /* the cross squeezes under the thumb; the button itself never scales (the ring gap) */
+.btn-x.is-held{border-color:var(--line);color:var(--ink-strong)}
+.btn-x.is-held .hold-arc{stroke-dashoffset:0;transition:stroke-dashoffset .7s linear}
+.btn-x.is-done{border-color:var(--good)} .btn-x.is-done .hold-arc{stroke:var(--good);stroke-dashoffset:0}
+
+/* Always dark (NOTES 39): the phone is in your hand, near your eyes, while you watch the big screen. A bright page flashing
+   in the corner of your eye is a distraction, so everything is dim and low contrast except the one thing worth a glance. */
+:root{--ink:#9aa7b2;--ink-strong:#dfe7ee;--ink-soft:#76838e;--bg:#0b1116;--line:#2f9fca;--line-deep:#1a86b3;--line-soft:#274a5c;--link:#6cc6ec;--good:#2fae5f;--warn:#c98a1e;color-scheme:dark}
+body{background:var(--bg);background-image:none}
+/* A hit: the WHOLE screen flashes in the ball trail's colour for that hit (white tap -> yellow -> orange -> red smash, scene.js
+   drawTrail), brightest at the edges, and fades. Lit in ~25 ms, so it lands with the buzz. pad.js sets --c and --n. */
+#glow{position:fixed;inset:0;z-index:10;pointer-events:none;opacity:0;mix-blend-mode:plus-lighter;      /* light added, like the trail's additive ribbon: a yellow reads yellow on the dark page, not olive */
+  --c:#fff;--n:0;
+  box-shadow:inset 0 0 0 calc(.5rem + .75rem * var(--n)) var(--c),inset 0 0 calc(3rem + 5rem * var(--n)) calc(1rem + 2rem * var(--n)) var(--c);
+  background:radial-gradient(ellipse at center,color-mix(in srgb,var(--c) calc(72% + 18% * var(--n)),transparent) 0%,var(--c) 100%)}
+.logo-mark{filter:none;opacity:.85}
+.btn{background:#16212a;border-color:#2a4b5c;color:var(--ink-strong);box-shadow:none}
+.btn:active{background:#1c2a35}
+.btn-hold::before{background:#2a5a70}
+input{background:#121b22;border-color:#274a5c;color:var(--ink-strong)}
+input::placeholder{color:#3a4c58}
+.code-field{background:#121b22;border-color:#274a5c} .code-field input{background:none} .code-pre{color:#4d6878}
+.ring{background:#111a21;border-color:#23394a;box-shadow:none}
+.ring-fill{background:linear-gradient(180deg,#1f5f7d,#2f9fca);opacity:.6}
+body[data-link="on"] .ring{border-color:#23713f}
+body[data-link="wait"] .ring{border-color:#7a5716}
+.art rect[fill="#fff"]{fill:#1a2630}
+.art rect[fill="#eaf6fc"]{fill:#22364a}
+.art rect[fill="#fdf3ea"],.art path[fill="#fdf3ea"]{fill:#b9a592}
+.art g[stroke="#5b6670"]{stroke:#8795a1}
+.art rect[fill="#5b6670"]{fill:#8795a1}
+.art text{fill:var(--ink-strong)}
+.art .cam-plate{fill:#22364a;stroke:#8795a1} .art .cam-lens{fill:#8795a1} .art .cam-glass{fill:#0d141a} .art .cam-flash{fill:#8a7f55;stroke:#8795a1}      /* the camera bar, dark like the rest */
+
+/* Motion: decorative only, and only for people who have not asked for less. The hold bar and ring fills above stay at 0.7 s
+   whatever the setting: they are information (how long left to hold), not decoration. */
+@media (prefers-reduced-motion:no-preference){
+.view > :not(.btn-x){animation:view-rise .42s var(--ease-out) backwards}      /* a CSS animation replays on every display:none -> flex, so each view switch rises in, no JS. Never on .view itself: a transform there would re-anchor the fixed X */
+.view > :nth-child(2){animation-delay:50ms} .view > :nth-child(3){animation-delay:100ms} .view > :nth-child(n+4):not(.btn-x){animation-delay:150ms}
+.btn-x{animation:x-in .4s var(--ease-bounce) .25s backwards}      /* the scale property, so translateX(-50%) stays */
+.btn-hold:not(.btn-x).is-done{animation:hold-done .42s var(--ease-bounce)}      /* a little 'got it' pop; scale composes with the :active press */
+.code-field.is-bad{animation:nudge .42s var(--ease-soft)}      /* a 'no' head-shake on a bad code */
+#code-note.is-new{animation:view-rise .42s var(--ease-out) .15s backwards,note-in .3s var(--ease-out)}      /* view-rise re-listed as it is (same name: not replayed), note-in added */
+#go{animation:view-rise .42s var(--ease-out) .15s backwards,go-breathe 2.4s var(--ease-soft) 1.2s infinite}      /* re-lists view-rise: a new list replaces the old */
+.art > path,.art > text{animation:art-nudge 1.4s var(--ease-soft) infinite}      /* only the 'edge up' arrow and label, not the hand or phone */
+body[data-link="wait"] .ring{animation:view-rise .42s var(--ease-out) backwards,ring-wait 1.6s var(--ease-soft) infinite}      /* a slow amber breath while it hunts: no link, so no rally */
+.logo-ball{animation:ball-drop .8s var(--ease-out) .1s backwards}      /* the o drops in and bounces once, on load */
+}
+.ring{transition:border-color var(--d-med) var(--ease-soft)}
+@keyframes view-rise{from{opacity:0;transform:translateY(.75rem)}}
+@keyframes x-in{from{opacity:0;scale:.5}}
+@keyframes hold-done{40%{scale:1.06}}
+@keyframes note-in{from{opacity:0;translate:0 .375rem}}
+@keyframes nudge{20%{translate:-.375rem}40%{translate:.375rem}60%{translate:-.25rem}80%{translate:.125rem}}
+@keyframes go-breathe{50%{scale:1.035}}
+@keyframes art-nudge{50%{transform:translateY(-4px)}}
+@keyframes ring-wait{50%{border-color:#4a3510}}
+@keyframes ball-drop{0%{transform:translateY(-1.1em) rotate(-120deg);opacity:0}55%{transform:translateY(0) scale(1.14,.86)}75%{transform:translateY(-.14em) scale(.96,1.04)}100%{transform:none}}
+
+.pad-ultimate{width:100%;max-width:22rem;padding:.65rem;border:3px solid #6673c6;border-radius:.6rem;background:linear-gradient(145deg,#fff,#e6eaff);box-shadow:0 4px 0 #464e8e;color:#26364a}
+.pad-ultimate-head{display:flex;justify-content:space-between;gap:1rem;font-size:.8rem;font-weight:900;letter-spacing:.06em}.pad-ultimate-head b{color:#6350b5}
+.pad-ultimate-meter{height:.75rem;margin:.5rem 0;border:2px solid #6371a8;border-radius:.2rem;background:#ccd6f0;overflow:hidden}.pad-ultimate-meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,#35d4ff,#b969f4);transition:width .18s ease-out}
+.pad-ultimate-actions{display:flex;gap:.5rem}.pad-ultimate-actions .btn{flex:1;min-width:0;padding:.55rem .5rem;border-radius:.4rem;font-size:.83rem;border:2px solid #288cbb;border-bottom-width:4px;color:#15475b;background:linear-gradient(#8ee9ff,#41bbee)}.pad-ultimate-actions #pad-ultimate-slow{border-color:#9653bb;color:#54216e;background:linear-gradient(#deb7fa,#bb83e6)}.pad-ultimate-actions .btn:disabled{opacity:.45;filter:saturate(.5);pointer-events:none}.pad-ultimate small{display:block;margin-top:.45rem;font-size:.73rem;font-weight:800;line-height:1.3}.pad-ultimate.is-ready{border-color:#d3a63a;background:linear-gradient(#fffdeb,#fff0b5)}.pad-ultimate.is-ready .pad-ultimate-head b{color:#9a5b14}
+@media(prefers-reduced-motion:reduce){.pad-ultimate-meter i{transition:none}}

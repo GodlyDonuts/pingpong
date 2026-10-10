@@ -1,0 +1,22 @@
+{
+  "name": "poddle-shot-risk",
+  "version": "1.0.0",
+  "description": "Original Poddle court and phone swings with weak, overhit and missed-return faults",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/padmotion.test.mjs test/poddle-challenge.test.mjs test/poddle-strength-sensor.test.mjs test/shotinput-sensor.test.mjs test/poddle-strength-timing.test.mjs test/poddle-bounce-window.test.mjs test/poddle-shot-risk.test.mjs test/poddle-wing.test.mjs test/poddle-positional-doubles.test.mjs test/poddle-ultimate.test.mjs test/poddle-phonepose.test.mjs test/poddle-haptics.test.mjs test/release-notes.test.mjs test/poddle-spike.test.mjs test/poddle-net.test.mjs test/poddle-swingresponse.test.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@mediapipe/tasks-vision": "^1.0.1",
+    "puppeteer-core": "^25.11.0"
+  }
+}

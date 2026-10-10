@@ -1,0 +1,37 @@
+{
+  "name": "Ping Pong: phone paddle",
+  "short_name": "Ping Pong",
+  "description": "Original Poddle court and phone swings with shot risk. Play 1v1 or 2v2 online.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#dfeef6",
+  "theme_color": "#dfeef6",
+  "lang": "en",
+  "categories": [
+    "games",
+    "sports"
+  ],
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

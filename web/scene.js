@@ -1,0 +1,1847 @@
+// All visuals + WebAudio. No networking, no motion maths. Uses the global THREE (r160).
+// Frames: world x right (seen from side 0), y up, side 0 defends +z, net at z=0.
+// Player frame (q, offset): x = player's right, y = up, z = toward the player. Side 1 = world rotated 180deg about Y.
+
+const G = 9.81, BALL_R = 0.11;
+// ---------- riding out a bad connection ----------
+// The server owns the ball. Between packets the client only has to know where that ball is NOW, and between hits a ball
+// is pure physics, so every client works out the same answer. coast() is the server's own flight (spin-lightened
+// gravity, a hard drive's sideways curl until the first bounce, the first bounce with its spin and sideways kick), in closed
+// form, for up to COAST_MAX seconds with no news. The curl c (m/s^2) is the server's own number, sent on hit/launch/state, and so is
+// a re-aim's bend w (below). The next packet or hit event is the truth again; nothing here decides a hit, a bounce call or a point.
+const COAST_MAX = 0.6;
+// A re-aim's bend (server/game.js reaim / bent(), NOTES 154): extra velocity v (x, z) brought in on a smoothstep over W s from server time t0,
+// then flown straight on. It rides on launch / state as w = [vx, vz, W, t0] (four numbers a bend: a swoop's sideways part is a bend of its own, and a legacy client's second re-aim adds more) while
+// one is still bending the ball; the share of W gone is read off the packet's own server t, so coast() needs no other clock. Same numbers as the
+// server's RAMP / RAMP1 / bent(): change both or neither.
+const RAMP = x => (x <= 0 ? 0 : x >= 1 ? x - 0.5 : x * x * x * (1 - 0.5 * x)), RAMP1 = x => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
+const bendOf = w => (Array.isArray(w) && w.length && w.length % 4 === 0 && w.every(Number.isFinite) && w.every((a, i) => i % 4 !== 2 || a > 0) ? w.slice() : null);
+const FLOOR = { up: 0.7, along: 0.78 }, SPUN = { lift: 0.3, up: 0.55, along: 0.45 };       // = BOUNCE / SLICE in server/game.js
+// coast(), but it will not carry the ball through the far player. With no news for over 100 ms and the ball arriving at
+// their paddle (farZ, signed), the likeliest truth is that they are hitting it: wait there for the packet. Guessing wrong
+// costs a short pause at the baseline; flying on costs a ball metres behind them that then has to come all the way back.
+export function coastTo(outP, outV, p, v, age, spin, bounces, kick, farZ, curl = 0, w = null, tS = NaN) {
+  coast(outP, outV, p, v, age, spin, bounces, kick, curl, w, tS);
+  const s = Math.sign(farZ);
+  if (age <= 0.1 || !s || v[2] * s <= 0 || outP.z * s < farZ * s) return;
+  let lo = 0.1, hi = age;
+  coast(outP, outV, p, v, lo, spin, bounces, kick, curl, w, tS); if (outP.z * s >= farZ * s) return;      // already there in the last packet's own 100 ms
+  for (let i = 0; i < 10; i++) { const mid = (lo + hi) / 2; coast(outP, outV, p, v, mid, spin, bounces, kick, curl, w, tS); if (outP.z * s < farZ * s) lo = mid; else hi = mid; }
+  coast(outP, outV, p, v, lo, spin, bounces, kick, curl, w, tS);
+}
+
+// A ball hanging for the serve is not falling: the server floats it after the server's hand and sends its real drift as
+// v. Carry it along that drift and nothing else. (Gravity here made it sag between packets and snap back up on each one:
+// a millimetre on a LAN, a 5 cm sawtooth on a jittery link.) The drift is a damped spring, so past HOVER_MAX just wait.
+const HOVER_MAX = 0.25;
+export function hover(outP, outV, p, v, age) {
+  outP.set(p[0] + v[0] * age, Math.max(BALL_R, p[1] + v[1] * age), p[2] + v[2] * age); outV.set(v[0], v[1], v[2]);
+}
+
+// Server clock. A packet is stamped with when the server MADE it, not when it got here: a packet that sat 80 ms in a
+// wifi retry is 80 ms old, and drawing it as fresh would yank a fast ball a metre back. The least-delayed packet of the
+// last couple of seconds sets the offset between the two clocks; every other packet is aged by how much later it came.
+export function serverClock() {
+  const d = new Float64Array(96); let n = 0, off = NaN;
+  return { reset() { n = 0; },
+    madeAt(t, arrived) {                                         // t: the packet's server time (s). arrived: local ms. -> local ms it was made
+      if (!isFinite(t)) return arrived;
+      const dd = arrived - t * 1000;
+      if (Math.abs(dd - off) > 1500) n = 0;                      // the server restarted (its clock starts again), or this tab slept
+      d[n++ % 96] = dd;
+      let m = Infinity; for (let i = Math.min(n, 96) - 1; i >= 0; i--) if (d[i] < m) m = d[i];
+      off = m;
+      return Math.max(arrived - COAST_MAX * 1000, t * 1000 + m);
+    } };
+}
+// w, tS: a re-aim's bend (bendOf) and the server t of the packet p v are from (NaN: unknown, e.g. a test's own clock: flown without it)
+export function coast(outP, outV, p, v, t, spin, bounces, kick, curl = 0, w = null, tS = NaN) {
+  let x = p[0], y = p[1], z = p[2], vx = v[0], vy = v[1], vz = v[2], b = bounces;
+  for (let i = 0; i < 2 && t > 0; i++) {
+    const g = b ? G : G * (1 - SPUN.lift * spin), disc = vy * vy + 2 * g * Math.max(0, y - BALL_R), tf = (vy + Math.sqrt(disc)) / g;    // time until it reaches the floor (the server's sim bounces it right there too, NOTES 154)
+    const step = Math.min(t, tf), a = b ? 0 : curl;          // the curl pulls sideways until the first bounce (server/game.js CURVE), exactly as the sim does
+    x += vx * step + 0.5 * a * step * step; vx += a * step; z += vz * step; y += vy * step - 0.5 * g * step * step; vy -= g * step; t -= step;
+    if (!b && w && tS === tS) for (let k = 0; k < w.length; k += 4) {   // the bends, to the bounce: the ballistic step above already carried the velocity they gave
+      const W = w[k + 2], x0 = (tS - w[k + 3]) / W, x1 = x0 + step / W, dp = W * (RAMP(x1) - RAMP(x0)) - RAMP1(x0) * step, dv = RAMP1(x1) - RAMP1(x0);
+      x += w[k] * dp; vx += w[k] * dv; z += w[k + 1] * dp; vz += w[k + 1] * dv; }
+    if (step < tf) break;
+    y = BALL_R;
+    if (b) { vx = vy = vz = 0; break; }                    // a second bounce ends the rally; that call is the server's: wait on the floor
+    const sp = b ? 0 : spin, al = FLOOR.along + (SPUN.along - FLOOR.along) * sp;
+    vy *= -(FLOOR.up + (SPUN.up - FLOOR.up) * sp); vx = vx * al + kick; vz *= al; b++;
+  }
+  outP.set(x, Math.max(BALL_R, y), z); outV.set(vx, vy, vz);
+}
+
+// Presentation only: a delayed fault packet must not let a low ball coast
+// through the mesh. Wait at its incoming face until the server calls contact.
+// Legal clearances, balls outside the posts and floor bounces are untouched.
+export function netIntercept(b, age, court = DEFAULT_COURT) {
+  const home = Math.sign(b.p[2]);
+  if (b.held || !home || b.v[2] * home >= 0 || age <= 0) return null;
+  const g = b.bounces ? G : G * (1 - SPUN.lift * b.spin);
+  const floor = (b.v[1] + Math.sqrt(b.v[1] ** 2 + 2 * g * Math.max(0, b.p[1] - BALL_R))) / g;
+  const until = Math.min(COAST_MAX, floor - 1e-6);
+  if (until <= 0) return null;
+  const fly = t => coast(sP, sV, b.p, b.v, t, b.spin, b.bounces, b.kick, b.curl, b.w, b.tS);
+  fly(until); if (sP.z * home > 0) return null;
+  let lo = 0, hi = until;
+  for (let i = 0; i < 14; i++) { const mid = (lo + hi) / 2; fly(mid); if (sP.z * home > 0) lo = mid; else hi = mid; }
+  fly(hi);
+  if (Math.abs(sP.x) > court.halfW + BALL_R || sP.y > court.net + BALL_R) return null;
+  const p = [sP.x, sP.y, home * (BALL_R + .02)];
+  // The sphere meets the net before its centre would cross the plane.
+  lo = 0; const face = BALL_R + .02;
+  for (let i = 0; i < 12; i++) { const mid = (lo + hi) / 2; fly(mid); if (sP.z * home > face) lo = mid; else hi = mid; }
+  return age >= hi ? p : null;
+}
+
+const SMASH_N = 0.76, SMASH_RED = 0.95;  // SMASH_N = SMASH in server/game.js: n above this is a smash. SMASH_RED: where its trail turns pure red
+// The power the trail SHOWS (NOTES 70): a lob or dink is a soft shot however hard the scoop, so it burns white; only a called smash may pass
+// SMASH_N, which the red, the embers and the flame all key on (a hard flat drive tops out at orange). main.js sends the phone the same value.
+export const shownN = (n, kind) => kind === 'lob' || kind === 'dink' ? 0 : kind === 'smash' || kind === 'spike' ? n : Math.min(n, SMASH_N);
+const BET_SHOW = 0.3;                     // a hit struck on the early bet shows pale yellow until the settled swing (or 0.3 s of silence) says what it was: 60% of real bets sit at the 0.76 cap
+const PADDLE_SCALE = 1.6;                 // Wii-sized so it reads from 5 m behind
+const VIEW_PARALLAX = 1;                  // head-coupled camera strength: 0 = locked-off, 1 = full
+const VIEW = { x: 1.7, y: 0.45, back: 2.2, tau: 0.22 };   // eye travel (m) at viewer = 1: sideways, up, drift back; follow time (s)
+const DEFAULT_COURT = { halfW: 3.05, halfL: 6.7, kitchen: 2.13, net: 0.91 };
+const COL = {
+  skyTop: '#2f7fd6', skyMid: '#8cc4ee', horizon: '#d6ecf7',
+  grass: 0x4f9a4a, apron: 0x2e7d56, court: 0x2a66b3, kitchen: 0xe0813f, line: 0xffffff,
+  screen: 0x17513a, skin: 0xf2c9a0,
+  matt: { skin: 0x6b4226, shirt: 0xf26b1d, hair: 0x15110e },       // the bot is Matt: a Black man in an orange shirt, whichever end he plays
+  shirt: [0xe5484d, 0xf5b324], hair: [0x3a2a1e, 0x1d1d26], face: ['#e5484d', '#f5b324'], kit: 0x20222c,      // kit: shorts and shoes
+};
+// The venue: what the court and the plain fallback look (sky, fog, lights: the values web/scenery/ replaces when it arrives) are made of.
+// 'park' is the one venue (the Ranked stadium went with the mode, docs/TROPHIES.md 2): the table shape stays so web/scenery/ keys on a name.
+const VENUE = {
+  park: { sky: [COL.skyTop, COL.skyMid, COL.horizon], fog: [COL.horizon, 38, 160], sun: [0xfff0d2, 3.3], hemi: [0xd6e9ff, 0x4f7a4a, 1.35], clouds: true, trees: true,
+    grass: COL.grass, apron: COL.apron, court: COL.court, kitchen: COL.kitchen, line: COL.line, screen: COL.screen, rail: 0xd9dde3 },
+};
+
+// Kinematic-arm fallback, replaced by motion.js's armOffset when that module loads.
+const ARM = [0.18, -0.22, -0.68];
+function localArm(P) {
+  const [x, y, z, w] = P, [vx, vy, vz] = ARM;
+  const tx = 2 * (y * vz - z * vy), ty = 2 * (z * vx - x * vz), tz = 2 * (x * vy - y * vx);
+  return [w * tx + y * tz - z * ty, w * ty + z * tx - x * tz, w * tz + x * ty - y * tx];   // = P(v) - v
+}
+let armImpl = localArm;
+import('./motion.js').then(m => { if (typeof m.armOffset === 'function') armImpl = m.armOffset; }).catch(() => {});
+function armOffset(P) {
+  try { const o = armImpl(P); if (o && isFinite(o[0] + o[1] + o[2])) return o; } catch (e) { armImpl = localArm; }
+  return localArm(P);
+}
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t * t * (3 - 2 * t);
+const sgn = side => (side % 2 === 0 ? 1 : -1);
+const damp = (dt, tau) => 1 - Math.exp(-dt / tau);
+// The drawn ball while it is live (updateBallVis; test/drawlob.mjs drives this very function). vA: scratch. true: it snapped (the trail starts over).
+// core follows the packets, err is what is left of a correction, eased out: a hit moved the truth (a late swing meets the ball where it WAS),
+// so the ball takes the new velocity at once and slides onto the new path instead of teleporting. Across and along only, once struck:
+// the server seals the ball at contact (NOTES 90), so from a hit to its first bounce the drawn HEIGHT is the path as the contact frame
+// sees it (one parabola at the ball's own gravity, on the local clock) with what was off taken out on a curve that only ever pulls
+// down. Nothing after the hit can lift it. The smoothstep on the height put the drawn vy 2-4 m/s over the path for a few frames after
+// every hit (a lob's little helium kick even with a perfect server), and packets re-stamped on a jittery link bobbed it up by up to
+// 0.9 m/s a frame.
+// A correction (blend) is measured from where the drawn ball would be THIS frame had it flown on as the truth did (err = drawn - truth, both
+// a frame ago), so taking it out on the smoothstep (flat at the start) leaves the drawn ball moving as the truth moves on that very frame.
+// The truth a frame ago: a hit that brought its flight turned it at the hit's OWN time (b.turn: a later packet may have come in the same
+// frame), flying in at last frame's velocity until then, so a late one (lag compensation) still slides onto its path; anything else is the
+// record's own flight, coasted on when it is older than a frame, else run back along it (never at a velocity from past a bounce it has not
+// reached, nor back through the floor it just left); an old server's hit (no flight on it) at last frame's velocity until the news. It was measured from where the ball was drawn
+// LAST frame against the truth NOW, which counted a frame of real travel as error: at every hit, re-aim and arc end the ball stood nearly
+// still for a frame (0.09x its speed), then surged 1.3-1.4x to catch up, 775-995 m/s^2 (NOTES 154).
+const sP = { x: 0, y: 0, z: 0, set(x, y, z) { this.x = x; this.y = y; this.z = z; } }, sV = { x: 0, y: 0, z: 0, set(x, y, z) { this.x = x; this.y = y; this.z = z; } };
+export function drawBall(b, vA, now, dt, farZ) {
+  const raw = (now - b.stamp) / 1000, age = clamp(raw, 0, b.held ? HOVER_MAX : COAST_MAX), ux = b.vel.x, uy = b.vel.y, uz = b.vel.z;   // u: the truth's velocity last frame
+  if (b.held) hover(vA, b.vel, b.p, b.v, age);
+  else coastTo(vA, b.vel, b.p, b.v, age, b.spin, b.bounces, b.kick, farZ, b.curl, b.w, b.tS);
+  const arc = b.arc;
+  if (arc && arc.t0 != null && (b.held || b.bounces || now - arc.t0 >= arc.T * 1000)) { b.arc = null; b.blend = true; }   // down: the packets have the height back, eased from where it is drawn
+  let snapped = false;
+  if (b.blend) {
+    const tn = b.turn, a = Math.min(dt, age); b.blend = false; b.turn = null;
+    if (tn && tn.p) { const aT = (now - tn.stamp) / 1000;        // the hit's own record: coasted on from it, or back to it and in at the old velocity
+      if (aT >= dt) coastTo(sP, sV, tn.p, tn.v, Math.min(aT - dt, COAST_MAX), b.spin, 0, tn.k, farZ, tn.c, null, NaN); else sP.set(tn.p[0] - ux * (dt - aT), tn.p[1] - uy * (dt - aT), tn.p[2] - uz * (dt - aT)); }
+    else if (tn) sP.set(vA.x - b.vel.x * a - ux * (dt - a), vA.y - b.vel.y * a - uy * (dt - a), vA.z - b.vel.z * a - uz * (dt - a));
+    else if (b.held) hover(sP, sV, b.p, b.v, Math.min(raw - dt, HOVER_MAX));
+    else if (raw >= dt) coastTo(sP, sV, b.p, b.v, Math.min(raw - dt, COAST_MAX), b.spin, b.bounces, b.kick, farZ, b.curl, b.w, b.tS);   // raw: a ball held at COAST_MAX did not move either
+    else { const r = dt - raw, g = b.bounces ? G : G * (1 - SPUN.lift * b.spin), p = b.p, v = b.v;   // under a frame old: back along its own flight, and past a bounce it came off since at last frame's velocity (the one it came down at)
+      const s = b.bounces ? Math.min(r, (Math.sqrt(v[1] * v[1] + 2 * g * Math.max(0, p[1] - BALL_R)) - v[1]) / g) : r;
+      sP.set(p[0] - v[0] * s - ux * (r - s), p[1] - (v[1] + 0.5 * g * s) * s - uy * (r - s), p[2] - v[2] * s - uz * (r - s)); }
+    b.err.set(b.pos.x - sP.x, b.pos.y - sP.y, b.pos.z - sP.z);
+    const e = b.err.length(); if (e > 5) b.snap = true; else { b.core.copy(vA); b.errT = 0; b.errDur = clamp(0.08 + 0.05 * e, 0.08, 0.18); }
+  }
+  if (b.snap || vA.distanceToSquared(b.core) > 2.2) { b.core.copy(vA); b.errT = 1; b.snap = false; snapped = true; }
+  else if (b.errT > 0) { b.core.addScaledVector(b.vel, dt); b.core.lerp(vA, damp(dt, 0.018)); }     // predict, then pull to the packet: hides LAN jitter, no lag
+  b.errT += dt / b.errDur;
+  b.pos.copy(b.core); if (b.errT < 1) b.pos.addScaledVector(b.err, 1 - ease(b.errT));
+  if (b.arc) {
+    const a = b.arc;
+    if (a.t0 == null) {                                    // the contact frame: the path as it stands now, and how far off it the ball is drawn
+      const g = G * (1 - SPUN.lift * b.spin), vy = b.vel.y, e = b.pos.y - vA.y;   // the server's ball IS the closed form (its sim adds the g dt^2 / 2 a v-then-p step leaves out, NOTES 154), so the path is anchored on the truth's own vy
+      // e goes as e (1 - t/tau)^2: drawn vy falls faster than the path's until it is gone, never slower, so it never rises. Taken off a
+      // ball drawn too HIGH that curve pulls down at 2e/tau^2 on top of gravity, so tau is long enough for that never to reverse it.
+      // Drawn too LOW (a late hit: the path has coasted on 1 m or more by the time it lands) the curve only adds to the fall, so any tau
+      // is safe: the ball leaves at 2|e|/tau over the path's vy, once, on the contact frame, and is on the server's ball within 0.25 s.
+      Object.assign(a, { t0: now, y: vA.y, vy, g, T: (vy + Math.sqrt(vy * vy + 2 * g * Math.max(0, vA.y - BALL_R))) / g, e, tau: Math.max(b.errDur, Math.min(e > 0 ? Infinity : 0.25, Math.sqrt(2 * Math.abs(e) / g))) });
+    }
+    const t = (now - a.t0) / 1000, path = a.y + a.vy * t - 0.5 * a.g * t * t, y = path + (t < a.tau ? a.e * (1 - t / a.tau) ** 2 : 0);
+    // The packets went somewhere this contact's path cannot: the packets win, next frame. The path, not the drawn ball: how far the ball
+    // is drawn off it is e, being taken out (a late hit's e is over 1 m on the contact frame, and dropping the arc there WAS the helium).
+    if (Math.abs(path - b.core.y) > 1) { b.arc = null; b.blend = true; }
+    else b.pos.y = y;
+  }
+  b.pos.y = Math.max(BALL_R, b.pos.y);
+  return snapped;
+}
+// What a message does to the live ball's record (what drawBall() flies from). onEvent() and updateBall() below call these, and so do the tests
+// that replay the real server's stream into drawBall() (test/drawlob.mjs, test/bend.test.mjs): no hand copy to drift. stampOf(t): the local ms
+// a packet made at server time t was made. tS is kept for coast()'s bend; with b.ext (a test's own clock) it is NaN and the bend is not flown.
+export function ballTake(b, m, stampOf) {
+  const vOk = m.v && m.v.length === 3 && isFinite(m.v[0] + m.v[1] + m.v[2]);
+  if (m.type === 'net' && vOk && m.p && isFinite(m.p[0] + m.p[1] + m.p[2])) {
+    b.p = [...m.p]; b.v = [...m.v]; b.live = false; b.seen = true;
+    b.netHit = {p: [...m.p], v: [...m.v], age: 0};
+    b.arc = b.turn = b.w = b.betN = null; b.blend = b.snap = b.held = false;
+    b.spin = b.curl = b.kick = b.power = b.hot = b.pulse = 0;
+    b.pos.set(...m.p); b.core.copy(b.pos); b.vel.set(...m.v); b.errT = 1;
+  } else if (m.type === 'launch') {
+    if (isFinite(m.spin)) b.spin = clamp(+m.spin, 0, 1); if (isFinite(m.k)) b.kick = +m.k; if (isFinite(m.c)) b.curl = +m.c;      // c: the ball's own curl (from contact; a re-aim's swoop rides on its bend)
+    // A re-aim carries the ball as the server has it NOW (nothing jumped) and w, the bend that takes it from here onto the new marker, so it is
+    // taken as it stands: no blend. It used to blend, and drawBall() froze the ball for a frame on every re-aim (NOTES 154). Its vy is the struck one (NOTES 90).
+    if (vOk && m.p && b.seen && isFinite(m.p[0] + m.p[1] + m.p[2])) { b.p = [m.p[0], m.p[1], m.p[2]]; b.v = [m.v[0], m.v[1], m.v[2]]; b.stamp = stampOf(+m.t); b.w = bendOf(m.w); b.tS = b.ext ? NaN : +m.t; }
+  } else if (m.type === 'hit') {
+    b.netHit = null;
+    const p = m.p || b.p;
+    b.spin = clamp(+m.spin || 0, 0, 1); b.blend = b.seen; b.snap = !b.seen; b.lastBy = m.side; b.arc = m.v ? { t0: null } : null;   // arc: the height from here to the bounce is this contact's (drawBall)
+    b.turn = b.seen ? {} : null;                           // drawBall's blend: the truth turned here (an old server's hit carries no flight: {})
+    if (vOk && isFinite(p[0] + p[1] + p[2])) {             // the launch rides on the hit: no waiting for the next state packet
+      b.p = [p[0], p[1], p[2]]; b.v = [m.v[0], m.v[1], m.v[2]]; b.stamp = stampOf(+m.t); b.w = bendOf(m.w); b.tS = b.ext ? NaN : +m.t;
+      b.bounces = 0; b.kick = +m.k || 0; b.curl = +m.c || 0; b.held = false;
+      if (b.turn) b.turn = { stamp: b.stamp, p: b.p, v: b.v, k: b.kick, c: b.curl }; }
+  } else if (m.type === 'serve') { b.netHit = null; b.snap = true; b.arc = null; b.spin = 0; b.curl = 0; b.w = null; b.turn = null; }
+}
+// a state packet (m, optional: tests pass p v live alone) at local stamp `stamp`, made at server time tS
+export function ballState(b, p, v, live, stamp, spin, m, tS = NaN) {
+  if (live && !b.live) b.netHit = null;
+  if (isFinite(spin) && spin != null) b.spin = clamp(+spin, 0, 1);
+  if (live && !b.live) b.snap = true;
+  if (!live) b.arc = null;                               // the rally is over: no arc waits for the next one
+  if (m) { b.bounces = m.b | 0; b.kick = +m.k || 0; b.curl = +m.c || 0; b.held = m.serving != null; b.w = bendOf(m.w); }
+  b.p = p; b.v = v; b.live = !!live; b.stamp = stamp; b.tS = tS;
+  if (live) b.seen = true;
+}
+// The trail's heat: n -> 0..1 along white -> yellow -> orange -> red (u = 3*heat). Real strokes (data/*.jsonl, 63 at >= 9 rad/s, settled n:
+// p25 0.25, median 0.44, p75 0.79) used to hit red at n 0.59, so 37% burned red and 8 of those 23 were not smashes. Now below SMASH_N the ramp
+// stops at orange (0.18 cream, 0.30 pale yellow, 0.52 amber, 0.76 -> u 2.1 deep orange). A smash steps over into orange-red (u 2.4, 255,89,27)
+// and only burns pure red near full power (u^2 ramp to 3.0 at SMASH_RED 0.95; n 0.9 is 255,57,23): stepping straight to u 2.6 put every smash
+// in the red and kept it at 24% of strokes. Settled strokes now (u bands): white/pale 42%, yellow-amber 29%, orange 6%, orange-red 10% (the
+// lighter smashes), red 14%. Lobs never get here (shownN). web/pad.js trailRGB is this same ramp.
+const trailHeat = n => n > SMASH_N ? 0.8 + 0.2 * Math.pow(clamp((n - SMASH_N) / (SMASH_RED - SMASH_N), 0, 1), 2) : 0.70 * Math.pow(clamp((n - 0.06) / (SMASH_N - 0.06), 0, 1), 0.8);
+function trailRamp(t, out) { const u = 3 * t;                // -> out = [r, g, b], 0..1
+  out[0] = 1; out[1] = u < 1 ? lerp(1, 0.9, u) : u < 2 ? lerp(0.9, 0.5, u - 1) : lerp(0.5, 0.12, u - 2); out[2] = u < 1 ? lerp(1, 0.3, u) : u < 2 ? lerp(0.3, 0.12, u - 1) : lerp(0.12, 0.08, u - 2); return out; }
+function rng(seed) { return () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296); }
+
+function canvasTex(w, h, draw) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8;
+  return t;
+}
+function glowTex() {
+  return canvasTex(64, 64, (g) => {
+    const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.35, 'rgba(255,255,255,0.55)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+  });
+}
+
+// ---------- paddle model: origin at the grip, handle down (-y), face looks at the net (-z) ----------
+function facePath(hw, y0, y1, r, neck, P) {
+  P.moveTo(-neck, y0 - 0.03);
+  P.bezierCurveTo(-neck, y0 + 0.03, -hw, y0 + 0.01, -hw, y0 + 0.085);
+  P.lineTo(-hw, y1 - r); P.quadraticCurveTo(-hw, y1, -hw + r, y1);
+  P.lineTo(hw - r, y1); P.quadraticCurveTo(hw, y1, hw, y1 - r);
+  P.lineTo(hw, y0 + 0.085);
+  P.bezierCurveTo(hw, y0 + 0.01, neck, y0 + 0.03, neck, y0 - 0.03);
+  P.closePath();
+  return P;
+}
+function buildPaddle(side) {
+  const g = new THREE.Group();
+  const hw = 0.1, y0 = 0.085, y1 = 0.375, th = 0.014;
+  const faceTex = canvasTex(256, 512, (c, w, h) => {
+    c.fillStyle = COL.face[side]; c.fillRect(0, 0, w, h);
+    c.fillStyle = 'rgba(255,255,255,0.10)';                       // honeycomb-ish texture dots
+    for (let y = 0; y < h; y += 10) for (let x = (y / 10) % 2 ? 5 : 0; x < w; x += 10) { c.beginPath(); c.arc(x, y, 1.6, 0, 7); c.fill(); }
+    c.save(); c.translate(w / 2, h * 0.43); c.rotate(-0.5);
+    c.fillStyle = '#ffffff'; c.fillRect(-w, -34, w * 2, 44);
+    c.fillStyle = 'rgba(20,24,40,0.9)'; c.fillRect(-w, 18, w * 2, 12);
+    c.restore();
+    c.fillStyle = 'rgba(255,255,255,0.9)'; c.beginPath(); c.arc(w / 2, h * 0.24, 20, 0, 7); c.fill();
+    c.fillStyle = COL.face[side]; c.beginPath(); c.arc(w / 2, h * 0.24, 11, 0, 7); c.fill();
+  });
+  faceTex.repeat.set(1 / (hw * 2), 1 / (y1 - y0 + 0.03)); faceTex.offset.set(0.5, -(y0 - 0.03) / (y1 - y0 + 0.03));   // extrude UVs are in metres
+  const face = new THREE.Mesh(
+    new THREE.ExtrudeGeometry(facePath(hw - 0.006, y0, y1 - 0.006, 0.05, 0.02, new THREE.Shape()), { depth: th, bevelEnabled: true, bevelThickness: 0.002, bevelSize: 0.002, bevelSegments: 2, curveSegments: 14 }),
+    [new THREE.MeshStandardMaterial({ map: faceTex, roughness: 0.55 }), new THREE.MeshStandardMaterial({ color: 0x1b1d24, roughness: 0.6 })]);
+  face.position.z = -th / 2;
+  // edge guard: a ring around the face, a touch thicker
+  const outer = facePath(hw + 0.004, y0, y1 + 0.004, 0.056, 0.026, new THREE.Shape());
+  outer.holes.push(facePath(hw - 0.008, y0 + 0.004, y1 - 0.008, 0.046, 0.016, new THREE.Path()));
+  const guard = new THREE.Mesh(
+    new THREE.ExtrudeGeometry(outer, { depth: th + 0.004, bevelEnabled: true, bevelThickness: 0.002, bevelSize: 0.002, bevelSegments: 2, curveSegments: 14 }),
+    new THREE.MeshStandardMaterial({ color: 0x14161c, roughness: 0.45, metalness: 0.1 }));
+  guard.position.z = -(th + 0.004) / 2;
+  // tapered handle with wrapped grip, collar, butt cap
+  const gripTex = canvasTex(64, 64, (c) => {
+    c.fillStyle = '#23252e'; c.fillRect(0, 0, 64, 64);
+    c.strokeStyle = '#4a4f60'; c.lineWidth = 5;
+    for (let i = -64; i < 128; i += 21) { c.beginPath(); c.moveTo(i, 64); c.lineTo(i + 64, 0); c.stroke(); }
+  });
+  gripTex.wrapS = gripTex.wrapT = THREE.RepeatWrapping; gripTex.repeat.set(2, 5);
+  const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.0165, 0.02, 0.15, 20), new THREE.MeshStandardMaterial({ map: gripTex, roughness: 0.95 }));
+  handle.position.y = -0.005; handle.scale.z = 0.82;
+  const capM = new THREE.MeshStandardMaterial({ color: 0x0f1014, roughness: 0.5 });
+  const butt = new THREE.Mesh(new THREE.CylinderGeometry(0.0245, 0.022, 0.016, 20), capM); butt.position.y = -0.086; butt.scale.z = 0.85;
+  const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.0185, 0.012, 20), new THREE.MeshStandardMaterial({ color: COL.shirt[side % 2], roughness: 0.5 }));
+  collar.position.y = 0.068; collar.scale.z = 0.85;
+  g.add(face, guard, handle, butt, collar);
+  g.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  g.scale.setScalar(PADDLE_SCALE);
+  return g;
+}
+
+// ---------- the winner's trophy (NOTES 165): origin at the grip like the paddle, the cup up (+y), so the paddle's own attitude carries it ----------
+// A gold cup on a dark plinth. Shaded by hue (NOTES 162): the gold's own warm light (emissive) keeps its shaded side orange, never olive.
+function buildTrophy() {
+  const g = new THREE.Group(), cup = new THREE.Group();
+  const gold = new THREE.MeshStandardMaterial({ color: 0xffc938, roughness: 0.3, metalness: 0.15, emissive: 0x9a4a00, emissiveIntensity: 0.4 });
+  const plinthM = new THREE.MeshStandardMaterial({ color: 0x2b303b, roughness: 0.55 });
+  // the lathe's profile, radius then height: foot, stem with a knot, the bowl's outside, its lip, and back down the inside
+  const prof = [[0, 0], [0.074, 0], [0.078, 0.012], [0.034, 0.034], [0.019, 0.058], [0.019, 0.096], [0.032, 0.108], [0.019, 0.122], [0.03, 0.148], [0.074, 0.186], [0.104, 0.246], [0.117, 0.326], [0.123, 0.362], [0.112, 0.362], [0.099, 0.3], [0.068, 0.226], [0, 0.204]];
+  const bowl = new THREE.Mesh(new THREE.LatheGeometry(prof.map(p => new THREE.Vector2(p[0], p[1])), 32), gold);
+  const plinth = new THREE.Mesh(new THREE.CylinderGeometry(0.082, 0.092, 0.07, 28), plinthM); plinth.position.y = -0.035;
+  const band = new THREE.Mesh(new THREE.CylinderGeometry(0.0935, 0.0935, 0.014, 28), gold); band.position.y = -0.058;
+  cup.add(bowl, plinth, band);
+  for (const sx of [-1, 1]) { const h = new THREE.Mesh(new THREE.TorusGeometry(0.056, 0.0115, 10, 20, Math.PI), gold); h.position.set(sx * 0.1, 0.262, 0); h.rotation.z = -sx * Math.PI / 2; h.scale.y = 1.25; cup.add(h); }      // two ear handles, bulging outward
+  cup.position.y = -0.078;                                 // the hand closes on the stem
+  g.add(cup); g.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  g.scale.setScalar(1.5);                                  // Wii-sized, like the paddle it replaces
+  return g;
+}
+
+// ---------- named looks (NOTES 137, 144): a character reserved for one registered username ----------
+// TEMPORARY, until cosmetics exist. The username Dan (the developer's account, the same one ui.js DEV_NAMES gives the hammer
+// badge) always plays as a plain white figure with glowing orange eyes and an orange headband tied at the back, no hair. The
+// username Mae plays as a white lop-eared bunny: pink inside the ears, pink nose and cheeks, a pink bow on top, a cotton tail. It
+// overrides the side's shirt and hair in every view and venue, for everyone who sees that seat. Only a REGISTERED username
+// counts (a guest typing "Dan" gets the normal look); usernames are unique and confusable-folded on the server, so only the
+// account holding that username can carry it. Matt's seat and the menu's attract rally never take a named look.
+// To remove it: empty LOOKS. To turn it into cosmetics: have the server send each seat's look id instead of lookFor() here.
+export const LOOKS = {      // body: skin, shirt, shorts, shoes and hands. eyes: the default eyes stay
+  dan: { body: 0xf0f0f0, band: 0xff7a1a, bandGlow: 0x4d2408, glow: 0xff6f12, eyes: false },      // bandGlow: a little self-light, so the band stays orange on its shaded side
+  mae: { body: 0xf3f1ef, pink: 0xffb3c6, blush: 0xffc6d6, bow: 0xff6f9f, eyes: true },
+};
+const LOOK_NAMES = { dan: 'dan', mae: 'mae' };                         // lower-cased registered username -> LOOKS key
+export const lookFor = (name, reg) => (reg === true && typeof name === 'string' && LOOK_NAMES[name.trim().toLowerCase()]) || null;
+
+const MAE_EAR = [0.2, 0.19, -0.04, 0, -0.2, 0.55];     // Mae's ear: tip x (mirrored), y, z; then rotation x, y (mirrored: + turns the lining to face out), z (mirrored: + swings the bottom out)
+
+// ---------- Mii-ish avatar, built facing -z (the net, in the player frame) ----------
+const HEAD_Y = 1.47;                                     // the head's rest height on `upper`; breathing lifts it off this every frame
+function buildAvatar(side) {
+  const g = new THREE.Group();
+  const skin = new THREE.MeshStandardMaterial({ color: COL.skin, roughness: 0.7 });
+  const shirt = new THREE.MeshStandardMaterial({ color: COL.shirt[side % 2], roughness: 0.75 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x20222c, roughness: 0.8 });
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.25, 0.42, 6, 20), shirt); body.position.y = 0.74;
+  const kit = new THREE.MeshStandardMaterial({ color: COL.kit, roughness: 0.8 });      // shorts and shoes: their own material (not `dark`, the eyes'), so a named look can repaint them
+  const shorts = new THREE.Mesh(new THREE.SphereGeometry(0.255, 20, 12, 0, Math.PI * 2, Math.PI * 0.55, Math.PI * 0.45), kit); shorts.position.y = 0.55;
+  const head = new THREE.Group(); head.position.y = HEAD_Y;
+  const whiteM = new THREE.MeshStandardMaterial({ color: 0xf4f1ea, roughness: 0.6 }), whites = [], eyes = [], mattFace = [], feet = [];      // whites: kept (empty) for callers that loop over it
+  const halfEye = new THREE.SphereGeometry(0.036, 16, 10, 0, Math.PI * 2, Math.PI * 0.44, Math.PI * 0.56);      // an eye with its top cut off flat
+  head.add(new THREE.Mesh(new THREE.SphereGeometry(0.27, 28, 20), skin));
+  const hairM = new THREE.MeshStandardMaterial({ color: COL.hair[side], roughness: 0.9 });
+  const hair = new THREE.Mesh(new THREE.SphereGeometry(0.283, 28, 14, 0, Math.PI * 2, 0, Math.PI * 0.48), hairM);
+  hair.rotation.x = 0.42; head.add(hair);
+  for (const sx of [-1, 1]) {
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.036, 12, 10), dark);
+    eye.scale.set(1, 1.55, 0.5); eye.position.set(sx * 0.095, 0.0, -0.25); head.add(eye); eyes.push(eye);
+    // Matt's own face (after the Wii Sports champion): calm and a little pensive, never angry. The eyes are the lower part
+    // of an oval with a flat lid line across the top, so they read half-closed; the brows are heavy, low and almost level.
+    const mEye = new THREE.Mesh(halfEye, dark); mEye.scale.set(1.35, 1.45, 0.5); mEye.position.set(sx * 0.095, 0.004, -0.25);
+    const mWhite = new THREE.Mesh(halfEye, whiteM); mWhite.scale.set(1.62, 1.7, 0.36); mWhite.position.set(sx * 0.095, 0.005, -0.2455);
+    const lidLine = new THREE.Mesh(new THREE.BoxGeometry(0.118, 0.013, 0.024), dark); lidLine.position.set(sx * 0.096, 0.014, -0.2475); lidLine.rotation.set(0, sx * -0.36, sx * -0.05);
+    const brow = new THREE.Mesh(new THREE.BoxGeometry(0.112, 0.03, 0.03), dark); brow.position.set(sx * 0.098, 0.068, -0.244); brow.rotation.set(0.26, sx * -0.36, sx * 0.07);
+    for (const o of [mEye, mWhite, lidLine, brow]) { o.visible = false; head.add(o); mattFace.push(o); }
+    const foot = new THREE.Mesh(new THREE.SphereGeometry(0.11, 14, 10), kit);
+    foot.scale.set(1, 0.6, 1.5); foot.position.set(sx * 0.15, 0.065, -0.04); g.add(foot); feet.push(foot);
+  }
+  // Dan's face (LOOKS.dan): the default eyes' shape, lit from inside (a near-black base, so the sun adds nothing and the orange
+  // never washes to yellow), and a headband. The band is an open cone cut to the head sphere (r 0.27) between y 0.085 and 0.145,
+  // a hair proud of it, above the eyes (their tops are at 0.056); the knot and two short tails hang at the back (+z).
+  const danFace = [], D = LOOKS.dan, glowM = new THREE.MeshStandardMaterial({ color: 0x000000, roughness: 1, emissive: D.glow, emissiveIntensity: 1 });      // pure emission: no sun highlight on it
+  const bandM = new THREE.MeshStandardMaterial({ color: D.band, roughness: 0.7, side: THREE.DoubleSide, emissive: D.bandGlow, emissiveIntensity: 1 });      // intensity 1: ghostify fades it to the same grey as the rest
+  for (const sx of [-1, 1]) { const e = new THREE.Mesh(new THREE.SphereGeometry(0.036, 14, 10), glowM); e.scale.set(1.08, 1.6, 0.5); e.position.set(sx * 0.095, 0.0, -0.25); danFace.push(e); }
+  const rAt = y => Math.sqrt(0.27 * 0.27 - y * y) + 0.007;
+  const band = new THREE.Mesh(new THREE.CylinderGeometry(rAt(0.145), rAt(0.085), 0.06, 40, 1, true), bandM); band.position.y = 0.115;
+  const knot = new THREE.Mesh(new THREE.SphereGeometry(0.034, 14, 10), bandM); knot.scale.set(1.25, 0.9, 0.7); knot.position.set(0, 0.112, rAt(0.112) + 0.012);
+  danFace.push(band, knot);
+  for (const sx of [-1, 1]) { const tail = new THREE.Mesh(new THREE.BoxGeometry(0.046, 0.19, 0.012), bandM); tail.geometry.translate(0, -0.095, 0); tail.position.set(sx * 0.022, 0.11, rAt(0.112) + 0.02); tail.rotation.set(-0.12, 0, sx * 0.22); danFace.push(tail); }      // a negative x tips the hanging end out, away from the head
+  for (const o of danFace) { o.visible = false; head.add(o); }
+  // Mae (LOOKS.mae), a lop-eared bunny: the default eyes, and fur that is the skin material (white while she sits). Each ear
+  // is a flattened ellipsoid hung from the top of the head by its tip, broad face forward, the bottom swung out; its pink lining
+  // is on the front. A pink nose, two blush discs laid on the cheeks (lookAt the outward normal), a pink bow on top between the
+  // ears, and a cotton tail on the back of the body (on `upper`, so it crouches with her).
+  const maeParts = [], maeHead = [], M = LOOKS.mae, pinkM = new THREE.MeshStandardMaterial({ color: M.pink, roughness: 0.8 });
+  const blushM = new THREE.MeshStandardMaterial({ color: M.blush, roughness: 0.9 }), bowM = new THREE.MeshStandardMaterial({ color: M.bow, roughness: 0.55 });
+  const blob = new THREE.SphereGeometry(1, 20, 14), hang = new THREE.SphereGeometry(1, 20, 14).translate(0, -1, 0);      // hang: its top at the origin
+  for (const sx of [-1, 1]) {
+    const ear = new THREE.Group(); ear.position.set(sx * MAE_EAR[0], MAE_EAR[1], MAE_EAR[2]); ear.rotation.set(MAE_EAR[3], sx * MAE_EAR[4], sx * MAE_EAR[5]);
+    const fur = new THREE.Mesh(hang, skin); fur.scale.set(0.095, 0.23, 0.036);
+    const lining = new THREE.Mesh(hang, pinkM); lining.scale.set(0.064, 0.175, 0.014); lining.position.set(0, -0.04, -0.026);
+    ear.add(fur, lining); maeHead.push(ear);
+    const cheek = new THREE.Mesh(blob, blushM); cheek.scale.set(0.04, 0.025, 0.008); const n = new THREE.Vector3(sx * 0.16, -0.07, 0); n.z = -Math.sqrt(0.27 * 0.27 - n.x * n.x - n.y * n.y);
+    cheek.position.copy(n).multiplyScalar(1.005); cheek.lookAt(n.clone().multiplyScalar(2)); maeHead.push(cheek);      // looked at before it has a parent: local = world here
+  }
+  const nose = new THREE.Mesh(blob, pinkM); nose.scale.set(0.03, 0.02, 0.016); nose.position.set(0, -0.055, -0.263);
+  const bow = new THREE.Group(); bow.position.set(0, 0.262, -0.05); bow.rotation.x = -0.25;
+  for (const sx of [-1, 1]) { const loop = new THREE.Mesh(blob, bowM); loop.scale.set(0.075, 0.048, 0.03); loop.position.x = sx * 0.068; loop.rotation.z = sx * 0.3; bow.add(loop); }
+  const bowKnot = new THREE.Mesh(blob, bowM); bowKnot.scale.set(0.03, 0.03, 0.026); bow.add(bowKnot);
+  maeHead.push(nose, bow);
+  for (const o of maeHead) { o.visible = false; head.add(o); }
+  const cotton = new THREE.Mesh(new THREE.SphereGeometry(0.085, 16, 12), skin); cotton.position.set(0, 0.6, 0.255); cotton.visible = false;
+  maeParts.push(...maeHead, cotton);
+  const offHand = new THREE.Mesh(new THREE.SphereGeometry(0.075, 16, 12), skin); offHand.position.set(-0.42, 0.85, -0.12);
+  // Everything above the ankles hangs off `upper`, so a crouch can sink and squash the body while the feet stay on the
+  // court. Sinking the whole group instead would push the shoes through the paint.
+  const upper = new THREE.Group(); upper.add(body, shorts, head, offHand, cotton); g.add(upper);
+  g.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  g.scale.setScalar(1.3);
+  g.userData = { head, body, offHand, upper, feet, skin, shirt, kit, hairM, whites, hair, eyes, mattFace, danFace, looks: { dan: danFace, mae: maeParts } };      // looks: each named look's own parts, shown only while it sits
+  return g;
+}
+
+// ---------- canned swing for bots: [t, yaw, pitch, roll] degrees, player frame, YXZ ----------
+const IDLE = [14, -12, 12];
+const SWING = [[0, ...IDLE], [0.13, -64, 12, -30], [0.29, 72, 22, 38], [0.40, 62, 18, 30], [0.74, ...IDLE]];
+const SWING_CONTACT = 0.2;
+// Matt's overhead (NOTES 170): for a ball up past his head the same timing, but over the top: the face cocked back behind the head,
+// then down through the ball toward the net and on into the follow-through. pd.over (0..1) blends it in by the contact height.
+const OVERHEAD = [[0, ...IDLE], [0.13, -14, 78, -12], [0.29, 6, -28, 6], [0.40, 6, -46, 6], [0.74, ...IDLE]];
+const STRIDE = 0.62;                      // m of travel per footstep, Matt's run (NOTES 170)
+const FACE_C = 0.23 * PADDLE_SCALE, REACH_MAX = 0.4;      // grip -> face centre; how far a hit may tug the paddle toward the ball
+const BODY = [0.5, 0.68];                 // avatar centre, left of / behind the paddle base (player frame)
+const SERVE_STEP = 0.35;                  // m the body steps toward the hanging ball while it serves (looks only)
+// ---------- stance: a whole body inferred from one number, the height of the head ----------
+// Head height IS the paddle's y. bodytrack's T.y() returns exactly `base` at the spot the player calibrated on, and every
+// other source of y agrees: newPlayer starts at 1.0, and runAuto, runBot and the attract striker all recover to 1.0
+// between shots. So `base` is the standing baseline for humans, bots and the attract rally alike, with no per-seat
+// calibration to carry. Below it the knees bend; above it the player is up on their toes reaching for something.
+// The ranges are deliberately lopsided: y is clamped to 0.3..2.3, so a duck has 0.7 m to give and a stretch has 1.3 m,
+// but nobody stretches far before it stops being a stretch and becomes a reach.
+const STANCE = { base: 1.0, duck: 0.45, rise: 0.28, up: 0.8, sink: 0.17, toes: 0.115, lean: 0.34, squash: 0.11 };
+function swingEuler(t, out, keys = SWING) {
+  let i = 0; while (i < keys.length - 2 && t > keys[i + 1][0]) i++;
+  const a = keys[i], b = keys[i + 1], k = ease(clamp((t - a[0]) / (b[0] - a[0]), 0, 1));
+  for (let j = 0; j < 3; j++) out[j] = lerp(a[j + 1], b[j + 1], k);
+  return out;
+}
+
+export function createScene(containerEl) {
+  let court = { ...DEFAULT_COURT }, localSide = 0, lastMs = 0, timeS = 0; const venue = 'park';   // venue: the one VENUE key
+  // Three switches (docs/API-NEXT.md 2.1). Camera: menu beats spectator (broadcast | split | pov | free) beats seated (today's play camera).
+  let spectator = false, vName = 'broadcast', vSide = 0, menu = false, dim = false, frozen = false, drawn = 0, force = false, shadowHold = 0, easeT = 1;      // dim: paused behind the full blur. The menu's cheap picture, the play camera
+  const VIEWS = ['broadcast', 'split', 'pov', 'free'], free = { yaw: 20, pitch: 25, dist: 17, tz: 0 }, size = { w: 1, h: 1 };      // free: degrees off +x, degrees up, metres from the target (0, 0.9, tz); tz slides along the court so a player can be framed up close. It outlives view changes. (Not 35 off: a floodlight head hangs exactly there)
+  const still = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const pixelRatio = () => Math.min(window.devicePixelRatio || 1, 2) / (menu || dim ? 2 : 1);       // a menu (or a pause) is blurred glass over the court: half the pixels each way
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(pixelRatio());
+  renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.domElement.style.display = 'block';
+  containerEl.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(new THREE.Color(COL.horizon), 38, 160);
+  const camera = new THREE.PerspectiveCamera(50, 1, 0.3, 500);
+  const cam = { x: 0, shake: 0, kickX: 0, kickY: 0, fovBase: 44 }, impact = { until: -9, strength: 0 };
+  const view = { x: 0, y: 0, vx: 0, vy: 0, inX: 0, inY: 0, at: -9 };      // smoothed viewer offset + last setViewer()
+
+  // lights: hemisphere fill + ONE shadow-casting sun, frustum fitted to court + player run-off
+  const hemi = new THREE.HemisphereLight(0xd6e9ff, 0x4f7a4a, 1.35); scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xfff0d2, 3.3);
+  sun.position.set(-7, 16, 9); sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  Object.assign(sun.shadow.camera, { left: -11, right: 11, top: 12, bottom: -12, near: 2, far: 45 });
+  sun.shadow.camera.updateProjectionMatrix();
+  sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.03; sun.shadow.radius = 3;
+  scene.add(sun, sun.target);
+
+  // sky dome + clouds (the plain look: one gradient per venue; the scenery hides the whole group once its own sky has built)
+  const skyTexs = {}, skyTex = v => skyTexs[v] || (skyTexs[v] = canvasTex(4, 512, (g, w, h) => {
+    const gr = g.createLinearGradient(0, 0, 0, h), [top, mid, hor] = VENUE[v].sky;
+    gr.addColorStop(0, top); gr.addColorStop(0.36, mid); gr.addColorStop(0.5, hor); gr.addColorStop(1, hor);
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  }));
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(300, 24, 16), new THREE.MeshBasicMaterial({ side: THREE.BackSide, fog: false, depthWrite: false, map: skyTex('park') }));
+  const plainGroup = new THREE.Group(); plainGroup.add(sky); scene.add(plainGroup);
+  const plainSky = [plainGroup];                           // what web/scenery/ replaces when it loads (see docs/SCENERY.md)
+  let plainClouds = null;
+  {
+    const rnd = rng(7), geo = new THREE.SphereGeometry(1, 12, 8), mat = new THREE.MeshBasicMaterial({ color: 0xffffff, fog: false });
+    const clouds = new THREE.InstancedMesh(geo, mat, 70), m = new THREE.Matrix4(), q = new THREE.Quaternion(); let n = 0;
+    for (let c = 0; c < 14; c++) {
+      const a = rnd() * Math.PI * 2, d = 170 + rnd() * 80, cx = Math.cos(a) * d, cz = Math.sin(a) * d, cy = 38 + rnd() * 45, sz = 6 + rnd() * 6;
+      for (let k = 0; k < 5; k++) m.compose(new THREE.Vector3(cx + (k - 2) * sz * 0.8 + rnd() * 3, cy + rnd() * 2 - (k % 2) * 1.5, cz + rnd() * 6), q,
+        new THREE.Vector3(sz * (1.1 - Math.abs(k - 2) * 0.22), sz * (0.55 - Math.abs(k - 2) * 0.1), sz * 0.8)), clouds.setMatrixAt(n++, m);
+    }
+    plainGroup.add(clouds); plainClouds = clouds;
+  }
+  function plainLook() {                                   // the venue's fallback sky / fog / lights (what the scenery's palette overrides once that venue is built and shown)
+    const v = VENUE[venue]; sky.material.map = skyTex(venue); plainClouds.visible = v.clouds;
+    scene.fog.color.set(v.fog[0]); scene.fog.near = v.fog[1]; scene.fog.far = v.fog[2];
+    sun.color.setHex(v.sun[0]); sun.intensity = v.sun[1]; hemi.color.setHex(v.hemi[0]); hemi.groundColor.setHex(v.hemi[1]); hemi.intensity = v.hemi[2];
+  }
+
+  // ---------- everything beyond the fences lives in web/scenery/ (docs/SCENERY.md). Missing or broken: the plain sky above stays. ----------
+  let scenery = null;
+  import('./scenery/index.js').then(m => { scenery = m.createScenery(THREE, { scene, renderer, camera, sun, hemi, fog: scene.fog, plainSky, court: () => court, side: () => localSide, venue: () => venue }); })
+    .catch(e => { if (!/Failed to fetch|Cannot find module|404/i.test(String(e && e.message))) console.error('scenery:', e); });
+
+  // ---------- court (rebuilt by setCourt) ----------
+  const netFx = {parts: [], age: 2, x: 0, y: 0, push: 0, amplitude: 0, width: 0};
+  function clearNet() {
+    netFx.age = 2; netFx.amplitude = 0;
+    for (const part of netFx.parts) { part.mesh.geometry.attributes.position.array.set(part.base); part.mesh.geometry.attributes.position.needsUpdate = true; part.mesh.geometry.computeVertexNormals(); }
+  }
+  function updateNet(dt) {
+    if (netFx.age >= 1.2 || frozen) return;
+    netFx.age += dt;
+    if (netFx.age >= 1.2) { clearNet(); return; }
+    const t = netFx.age, spring = Math.sin(t * 23) * Math.exp(-t * 4.8) * netFx.push * netFx.amplitude;
+    for (const part of netFx.parts) {
+      const a = part.mesh.geometry.attributes.position.array, base = part.base;
+      for (let i = 0; i < a.length; i += 3) {
+        const x = base[i] + part.mesh.position.x, y = base[i + 1] + part.mesh.position.y;
+        const anchored = Math.max(0, 1 - (x / netFx.width) ** 2);
+        const local = Math.exp(-(((x - netFx.x) / .8) ** 2) - ((y - netFx.y) / .65) ** 2);
+        const ripple = Math.sin(t * 23 - Math.abs(x - netFx.x) * 3) * Math.exp(-t * 6) * .12;
+        a[i + 2] = base[i + 2] + anchored * part.share * (spring * (.25 + .75 * local) + ripple * netFx.push * netFx.amplitude);
+      }
+      part.mesh.geometry.attributes.position.needsUpdate = true;
+      part.mesh.geometry.computeVertexNormals();
+    }
+  }
+  let courtGroup = null;
+  const backFence = [[], []], sideFence = [[], []];       // per side: the windscreen behind that baseline (hidden for whoever looks from there). sideFence: +x, -x (broadcast and free cam look over them)
+  const speckle = canvasTex(256, 256, (g, w, h) => {
+    g.fillStyle = '#fff'; g.fillRect(0, 0, w, h); const rnd = rng(3);
+    for (let i = 0; i < 5000; i++) { g.fillStyle = `rgba(0,0,0,${0.03 + rnd() * 0.07})`; g.fillRect(rnd() * w, rnd() * h, 1.5, 1.5); }
+  });
+  speckle.wrapS = speckle.wrapT = THREE.RepeatWrapping;
+  function slab(w, l, color, y, x = 0, z = 0, rep = 0) {
+    const map = rep ? speckle.clone() : null; if (map) { map.repeat.set(w * rep, l * rep); map.needsUpdate = true; }
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, l), new THREE.MeshStandardMaterial({ color, map, roughness: 0.92 }));
+    m.rotation.x = -Math.PI / 2; m.position.set(x, y, z); m.receiveShadow = true;
+    return m;
+  }
+  const banners = {}, keepTex = new Set([speckle]);        // the windscreen art, drawn once; textures a rebuild must not dispose
+  function bannerFor(v) {
+    if (banners[v]) return banners[v];
+    const t = banners[v] = canvasTex(2048, 256, (c, w, h) => {
+      c.fillStyle = '#17513a'; c.fillRect(0, 0, w, h);
+      c.fillStyle = 'rgba(255,255,255,0.05)'; for (let x = 0; x < w; x += 8) c.fillRect(x, 0, 2, h);
+      c.fillStyle = '#0f3a29'; c.fillRect(0, 0, w, 14); c.fillRect(0, h - 10, w, 10);
+      c.font = '800 96px "Avenir Next", "Helvetica Neue", Arial, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+      c.fillStyle = 'rgba(255,255,255,0.86)';
+      for (const x of [w * 0.2, w * 0.5, w * 0.8]) c.fillText('PODDLE', x, h / 2 + 4, w * 0.27);
+      c.fillStyle = '#f5d53a'; for (const x of [w * 0.35, w * 0.65]) { c.beginPath(); c.arc(x, h / 2, 26, 0, 7); c.fill(); }
+    });
+    keepTex.add(t); return t;
+  }
+  function buildCourt() {
+    clearNet(); netFx.parts.length = 0;
+    if (courtGroup) { scene.remove(courtGroup); courtGroup.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) { if (o.material.map && !keepTex.has(o.material.map)) o.material.map.dispose(); o.material.dispose(); } }); }   // a court rebuild (setCourt): nothing may leak
+    const g = courtGroup = new THREE.Group(), { halfW: W, halfL: L, kitchen: K, net: N } = court, LW = 0.07, V = VENUE[venue];
+    const fenceZ = L + 7.2, fenceX = W + 5.2; backFence[0].length = backFence[1].length = sideFence[0].length = sideFence[1].length = 0;
+    g.add(slab(600, 600, V.grass, -0.02));
+    g.add(slab(fenceX * 2, fenceZ * 2, V.apron, 0, 0, 0, 0.6));
+    g.add(slab(W * 2, L * 2, V.court, 0.004, 0, 0, 0.6));
+    g.add(slab(W * 2, K * 2, V.kitchen, 0.008, 0, 0, 0.6));
+    const line = (w, l, x, z) => { const m = slab(w, l, V.line, 0.012, x, z); m.material.roughness = 0.8; g.add(m); };
+    for (const s of [-1, 1]) {
+      line(W * 2 + LW, LW, 0, s * L);                       // baselines
+      line(LW, L * 2 + LW, s * W, 0);                       // sidelines
+      line(W * 2, LW, 0, s * K);                            // kitchen lines
+      line(LW, L - K, 0, s * (K + L) / 2);                  // centre lines
+    }
+    // net: mesh, tape, posts, centre strap, soft contact shadow
+    const NW = W + 0.3;                                   // server net is flat at N; keep the visual honest
+    const netTex = canvasTex(64, 64, (c) => {
+      c.clearRect(0, 0, 64, 64); c.strokeStyle = 'rgba(18,20,24,0.9)'; c.lineWidth = 3;
+      for (let i = 0; i <= 64; i += 16) { c.beginPath(); c.moveTo(i, 0); c.lineTo(i, 64); c.moveTo(0, i); c.lineTo(64, i); c.stroke(); }
+    });
+    netTex.wrapS = netTex.wrapT = THREE.RepeatWrapping; netTex.repeat.set(NW * 2 / 0.16, N / 0.16);
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(NW * 2, N - 0.06, 48, 8), new THREE.MeshBasicMaterial({ map: netTex, transparent: true, side: THREE.DoubleSide, depthWrite: false, opacity: 0.85 }));
+    mesh.position.y = (N - 0.06) / 2 + 0.04; mesh.renderOrder = 2; g.add(mesh);
+    const white = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7 });
+    const tape = new THREE.Mesh(new THREE.BoxGeometry(NW * 2, 0.055, 0.035, 48), white); tape.position.y = N - 0.0125; tape.castShadow = true; g.add(tape);
+    const strap = new THREE.Mesh(new THREE.BoxGeometry(0.05, N, 0.012, 1, 12), white); strap.position.y = N / 2; g.add(strap);
+    const hem = new THREE.Mesh(new THREE.BoxGeometry(NW * 2, 0.03, 0.02, 48), new THREE.MeshStandardMaterial({ color: 0x1a1c22 })); hem.position.y = 0.05; g.add(hem);
+    netFx.width = NW;
+    for (const [m, share] of [[mesh, 1], [tape, .75], [strap, .6], [hem, .2]]) netFx.parts.push({mesh: m, share, base: new Float32Array(m.geometry.attributes.position.array)});
+    const postM = new THREE.MeshStandardMaterial({ color: 0x20242c, roughness: 0.4, metalness: 0.5 });
+    for (const s of [-1, 1]) {
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.05, N + 0.08, 16), postM); post.position.set(s * NW, (N + 0.08) / 2, 0); post.castShadow = true;
+      const cap = new THREE.Mesh(new THREE.SphereGeometry(0.058, 14, 10), white); cap.position.set(s * NW, N + 0.09, 0); cap.castShadow = true;
+      const foot = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.18, 0.03, 20), postM); foot.position.set(s * NW, 0.015, 0); foot.receiveShadow = true;
+      g.add(post, cap, foot);
+    }
+    const netShadow = new THREE.Mesh(new THREE.PlaneGeometry(NW * 2, 0.9), new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, map: canvasTex(4, 64, (c, w, h) => {
+      const gr = c.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(0.5, 'rgba(0,0,0,0.28)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+      c.fillStyle = gr; c.fillRect(0, 0, w, h);
+    }) }));
+    netShadow.rotation.x = -Math.PI / 2; netShadow.position.y = 0.016; g.add(netShadow);
+    // windscreens behind both baselines (dark backdrop = the ball reads), lower ones down the sides
+    const screenM = new THREE.MeshStandardMaterial({ map: bannerFor(venue), roughness: 0.95 });
+    const sideM = new THREE.MeshStandardMaterial({ color: V.screen, roughness: 0.95, side: THREE.DoubleSide });
+    const railM = new THREE.MeshStandardMaterial({ color: V.rail, roughness: 0.4, metalness: 0.6 });
+    for (const s of [-1, 1]) {
+      const back = new THREE.Mesh(new THREE.PlaneGeometry(fenceX * 2, 2.4), screenM); back.position.set(0, 1.2, s * fenceZ); back.rotation.y = s > 0 ? Math.PI : 0; g.add(back);
+      const mine = backFence[s > 0 ? 0 : 1]; mine.push(back);      // the camera drifts back through its own fence when the player is deep or far offside
+      const rail = new THREE.Mesh(new THREE.BoxGeometry(fenceX * 2, 0.07, 0.07), railM); rail.position.set(0, 2.43, s * fenceZ); g.add(rail); mine.push(rail);
+      const sd = new THREE.Mesh(new THREE.PlaneGeometry(fenceZ * 2, 1.3), sideM); sd.position.set(s * fenceX, 0.65, 0); sd.rotation.y = -s * Math.PI / 2; g.add(sd);
+      const srail = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, fenceZ * 2), railM); srail.position.set(s * fenceX, 1.33, 0); g.add(srail); sideFence[s > 0 ? 0 : 1].push(sd, srail);
+      for (let i = -3; i <= 3; i++) { const p = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 2.5, 8), railM); p.position.set(i * fenceX / 3, 1.25, s * (fenceZ + 0.05)); g.add(p); mine.push(p); }
+    }
+    // trees outside the fence
+    if (V.trees) {
+    const rnd = rng(11), N_T = 46, trunks = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.22, 0.3, 1, 8), new THREE.MeshStandardMaterial({ color: 0x7a5535, roughness: 1 }), N_T);
+    const leafM = [0x3f8f45, 0x57a84f].map(c => new THREE.MeshStandardMaterial({ color: c, roughness: 1 }));
+    const leaves = leafM.map(m => new THREE.InstancedMesh(new THREE.SphereGeometry(1, 14, 10), m, N_T * 2)), cnt = [0, 0];
+    const M = new THREE.Matrix4(), Q = new THREE.Quaternion();
+    for (let i = 0; i < N_T; i++) {
+      const onSide = i % 2 === 0, s = rnd() < 0.5 ? -1 : 1;
+      const x = onSide ? s * (fenceX + 4 + rnd() * 16) : (rnd() * 2 - 1) * (fenceX + 16);
+      const z = onSide ? (rnd() * 2 - 1) * (fenceZ + 12) : s * (fenceZ + 5 + rnd() * 18);
+      const h = 2.0 + rnd() * 1.8, r = 1.2 + rnd() * 0.9;
+      M.compose(new THREE.Vector3(x, h / 2, z), Q, new THREE.Vector3(1, h, 1)); trunks.setMatrixAt(i, M);
+      const k = i % 2; M.compose(new THREE.Vector3(x, h + r * 0.55, z), Q, new THREE.Vector3(r, r * 0.95, r)); leaves[k].setMatrixAt(cnt[k]++, M);
+      M.compose(new THREE.Vector3(x + r * 0.5, h + r * 0.2, z + r * 0.3), Q, new THREE.Vector3(r * 0.65, r * 0.6, r * 0.65)); leaves[1 - k].setMatrixAt(cnt[1 - k]++, M);
+    }
+    leaves.forEach((l, k) => { l.count = cnt[k]; g.add(l); }); g.add(trunks);
+    }
+    scene.add(g); if (menu) shadowHold = 1;                // a frozen shadow map belongs to the old court
+  }
+  buildCourt();
+
+  // ---------- ball, blob shadow, trail ----------
+  // The ball's skin (NOTES 177): 40 holes (an outdoor ball's count) spread evenly over the sphere (a Fibonacci lattice), each drawn as a true
+  // circle ON the sphere, so none stretches near the poles the way ellipses on the flat map did. Per pixel, only inside each hole's box:
+  // antialiased edge, a rim a shade deeper, the floor deepest at the centre. Every shade is the logo's hue-shifted deep yellow (NOTES 162/163).
+  const ballTex = canvasTex(1024, 512, (c, w, h) => {
+    const img = c.createImageData(w, h), d = img.data, BODY = [0xe8, 0xfb, 0x2a], RIM = [0xdc, 0xbc, 0x00], DEEP = [0xa8, 0x8e, 0x00];
+    for (let i = 0; i < d.length; i += 4) { d[i] = BODY[0]; d[i + 1] = BODY[1]; d[i + 2] = BODY[2]; d[i + 3] = 255; }
+    const N = 40, R = 0.175, EDGE = 0.006, GOLD = Math.PI * (3 - Math.sqrt(5));
+    for (let k = 0; k < N; k++) {
+      const y = 1 - (2 * k + 1) / N, lat = Math.asin(y), lon = k * GOLD, cx = Math.cos(lat) * Math.cos(lon), cz = Math.cos(lat) * Math.sin(lon);
+      const r = R + EDGE, y0 = Math.max(0, Math.floor((0.5 - (lat + r) / Math.PI) * h)), y1 = Math.min(h - 1, Math.ceil((0.5 - (lat - r) / Math.PI) * h));
+      for (let py = y0; py <= y1; py++) {
+        const plat = (0.5 - (py + 0.5) / h) * Math.PI, cl = Math.cos(plat), sl = Math.sin(plat);
+        const span = Math.abs(plat) + r >= Math.PI / 2 - 1e-6 ? Math.PI : Math.min(Math.PI, Math.asin(Math.min(1, Math.sin(r) / Math.max(cl, 1e-6))) + 0.02);
+        const u0 = Math.floor(((lon - span) / (2 * Math.PI)) * w), u1 = Math.ceil(((lon + span) / (2 * Math.PI)) * w);
+        for (let pu = u0; pu <= u1; pu++) {
+          const px = ((pu % w) + w) % w, plon = ((pu + 0.5) / w) * 2 * Math.PI;
+          const dot = cl * Math.cos(plon) * cx + sl * y + cl * Math.sin(plon) * cz, a = Math.acos(Math.max(-1, Math.min(1, dot)));
+          if (a > R + EDGE) continue;
+          const cov = Math.min(1, (R + EDGE - a) / (2 * EDGE)), t = Math.min(1, a / R), floor = 1 - (1 - t) * (1 - t);   // 0 at the centre, 1 at the rim
+          const o = (py * w + px) * 4;
+          for (let ch = 0; ch < 3; ch++) { const hole = DEEP[ch] + (RIM[ch] - DEEP[ch]) * Math.pow(floor, 8); d[o + ch] = Math.round(d[o + ch] + (hole - d[o + ch]) * cov); }
+        } } }
+    c.putImageData(img, 0, 0);
+  });
+  // spin swirl: wind whipping round a sliced ball, turning the way its FIRST BOUNCE will go. The bounce (coast / bounceV in server/game.js) is a
+  // plain one plus, from the spin: forward speed cut by (FLOOR.along - SPUN.along) * spin, and the sideways kick. That extra change D in the ball's
+  // ground speed is what friction does to a ball whose bottom slides the other way, so the ball is drawn as spinning about w = up x D, like a wheel
+  // that will roll it along D when it lands: backspin = the underside rolling forward (it checks up), kick right = a wheel rolling right. |D| (m/s)
+  // sets how wild it is: fatter, more wisps, more wobble, more opaque, faster. Gone once the ball has bounced (the spin only bites on the first one).
+  // Three tapered wisps (pointed heads leading, tails fading), each with a thin one further out that joins as |D| grows. One mesh, a TRUE billboard:
+  // it lies flat in the screen of whichever camera draws it (split view draws the frame twice), and what it shows is the real spin seen from there:
+  //  - the part of w along the view is the turn: clockwise or anticlockwise, as the ball really turns on screen (seen along a backspin axis, broadcast);
+  //  - the part across the view is how the ball's FACE moves on screen (w x toward-camera): the ring's half that runs that way stays bright and the
+  //    other half fades, so the wisps visibly sweep that way past the ball. A backspin ball coming at you: they sweep UP the side of it (its face rolls
+  //    up and away); going away from you: down. Receiving a real slice, the kick (at least 0.55 of SLICE.kick, solve) also gives the turn: clockwise
+  //    = it kicks right, anticlockwise = left. With the axis across the view the turn is either way (the bright half moves the same way both ways),
+  //    so the choice has hysteresis and cannot flicker.
+  // The shape is rewritten into the same buffer each frame (updateSpinFx); the sweep is a uniform set per draw. Scaled up with distance like the
+  // serve cue, so it reads at game size.
+  const qFx = new THREE.Quaternion(), qRoll = new THREE.Quaternion(), zFx = new THREE.Vector3(0, 0, 1), sFx = new THREE.Vector3(), cFx = new THREE.Vector3(), nFx = new THREE.Vector3(), rFx = new THREE.Vector3();
+  const fxScale = (cam, p) => clamp(cam.position.distanceTo(p) / 6, 1, 1.8);                 // a ball at the far baseline still reads
+  const SW_SEG = 20, SW = [];                                 // per wisp: phase, radius at the head and at the tail (ball radii), sweep (rad), width (ball radii), alpha, companion?
+  for (let i = 0; i < 3; i++) { const ph = i * Math.PI * 2 / 3; SW.push([ph, 1.3, 2.3, 2.5, 0.9, 1, 0], [ph - 1.0, 2.15, 2.85, 1.5, 0.42, 0.8, 1]); }
+  const spinMat = new THREE.MeshBasicMaterial({ color: 0xe4f6ff, vertexColors: true, transparent: true, opacity: 0, depthWrite: false, fog: false, side: THREE.DoubleSide });
+  const swU = { value: new THREE.Vector3(1, 0, 0) }; spinMat.userData.sweep = swU;           // the sweep, set per draw: x, y = the screen direction of the ring's bright half, z = how much the other half fades
+  spinMat.onBeforeCompile = sh => { sh.uniforms.uSw = swU;
+    sh.vertexShader = 'varying vec2 vSw;\n' + sh.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n  vSw = (modelViewMatrix * vec4(position, 1.0)).xy - (modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xy;');
+    sh.fragmentShader = 'uniform vec3 uSw;\nvarying vec2 vSw;\n' + sh.fragmentShader.replace('#include <color_fragment>', '#include <color_fragment>\n  diffuseColor.a *= mix(1.0, 0.1 + 0.9 * smoothstep(-0.35, 0.75, dot(normalize(vSw), uSw.xy)), uSw.z);'); };
+  const spinFx = (() => { const nv = SW.length * (SW_SEG + 1) * 2, col = new Float32Array(nv * 4), idx = [];
+    SW.forEach(([, , , , , al], s) => { for (let j = 0; j <= SW_SEG; j++) { const u = j / SW_SEG, a = al * Math.min(1, u / 0.03) * Math.pow(1 - u, 1.2), o = (s * (SW_SEG + 1) + j) * 2;
+      for (const v of [o, o + 1]) col.set([1, 1, 1, a], v * 4);
+      if (j < SW_SEG) idx.push(o, o + 1, o + 2, o + 1, o + 3, o + 2); } });
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(nv * 3), 3)); g.setAttribute('color', new THREE.BufferAttribute(col, 4)); g.setIndex(idx);
+    return new THREE.Mesh(g, spinMat); })();
+  function updateSpinFx(w, t) {                              // w: how wild (0..1); t: time, for the wobble of the radii
+    const P = spinFx.geometry.attributes.position.array, k = 0.45 + 0.55 * w, extra = clamp((w - 0.25) / 0.45, 0, 1), wob = 0.04 + 0.2 * w; let q = 0;
+    SW.forEach(([ph, r0, r1, sw, wd, , co], s) => { const kw = k * (co ? extra : 1);
+      for (let j = 0; j <= SW_SEG; j++) { const u = j / SW_SEG, th = ph - u * sw, c = Math.cos(th), sn = Math.sin(th);      // it turns anticlockwise about its own z: the head leads, the tail trails
+        const r = BALL_R * (r0 + (r1 - r0) * u + wob * Math.sin(t * (4 + 6 * w) + s * 1.7 + u * 4)), hw = BALL_R * wd * kw * Math.sqrt(Math.min(1, u / 0.07)) * Math.pow(1 - u, 1.1) * 0.5;
+        P[q++] = c * (r - hw); P[q++] = sn * (r - hw); P[q++] = 0; P[q++] = c * (r + hw); P[q++] = sn * (r + hw); P[q++] = 0; } });
+    spinFx.geometry.attributes.position.needsUpdate = true;
+  }
+  const spinAxis = new THREE.Vector3(1, 0, 0); let spinRoll = 0, spinW = 0, swHit = -1, swLanded = false, swFrame = -1, swPass = 0; const swSide = [0, 0, 0, 0];
+  spinFx.frustumCulled = false; spinFx.renderOrder = 4; spinFx.visible = false; scene.add(spinFx);
+  spinFx.onBeforeRender = (r, sc, cam) => {
+    if (swFrame !== drawn) { swFrame = drawn; swPass = 0; }     // split view moves the one camera between its two draws: each draw of a frame keeps its own state
+    const pass = Math.min(swPass++, 3); cFx.subVectors(cam.position, spinFx.position).normalize(); const along = spinAxis.dot(cFx);
+    if (!swSide[pass] || along * swSide[pass] < -0.15) swSide[pass] = along < 0 ? -1 : 1;     // anticlockwise on this screen (+1) or clockwise; hysteresis round 0
+    const side = swSide[pass];
+    nFx.crossVectors(spinAxis, cFx);                          // how the ball's face moves, in the world; then on this screen (camera right, up)
+    const fx = nFx.dot(rFx.set(1, 0, 0).applyQuaternion(cam.quaternion)), fy = nFx.dot(rFx.set(0, 1, 0).applyQuaternion(cam.quaternion)), f = Math.hypot(fx, fy);
+    if (f > 1e-4) swU.value.set(fy * side / f, -fx * side / f, 0.95 * clamp((f - 0.35) / 0.45, 0, 1));     // f 0..1: none seen along the axis, full across it     // the half whose motion runs along it: direction rotated a quarter turn against the turn
+    else swU.value.set(1, 0, 0);
+    qFx.copy(cam.quaternion).multiply(qRoll.setFromAxisAngle(zFx, side * spinRoll));
+    const k = 1.2 * fxScale(cam, spinFx.position) * spinFx.scale.x;     // turning clockwise it is mirrored, so the heads still lead
+    spinFx.matrixWorld.compose(spinFx.position, qFx, sFx.set(side * k, k, k)); };
+  // serve cue: five short white arcs round the ball while it hangs for the serve, evenly spaced, turning slowly and breathing (the look the spin
+  // streaks had before the swirl). Billboarded per camera the same way; never on screen with the swirl (updateBallVis).
+  const serveMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthWrite: false, fog: false });
+  const serveFx = new THREE.Group(); let serveA = 0, serveRoll = 0;
+  for (let i = 0; i < 5; i++) { const arc = new THREE.Mesh(new THREE.TorusGeometry(BALL_R * 1.9, BALL_R * 0.13, 6, 10, 0.8), serveMat); arc.frustumCulled = false; arc.renderOrder = 4;
+    arc.onBeforeRender = (r, sc, cam) => { qFx.copy(cam.quaternion).multiply(qRoll.setFromAxisAngle(zFx, serveRoll + i * Math.PI * 2 / 5));
+      arc.matrixWorld.compose(serveFx.position, qFx, sFx.setScalar(fxScale(cam, serveFx.position) * serveFx.scale.x)); };
+    serveFx.add(arc); }
+  serveFx.visible = false; scene.add(serveFx);
+  const ballMesh = new THREE.Mesh(new THREE.SphereGeometry(BALL_R, 48, 32), new THREE.MeshStandardMaterial({ map: ballTex, roughness: 0.45, emissive: 0xffffff, emissiveMap: ballTex, emissiveIntensity: 1.6 }));
+  // The ball lights itself: from side 1 you see its shaded face (it measured 1.16 : 1 against the kitchen, 1.25 : 1 against the court), from side 0 the lit face
+  // was 1.31 : 1 on the low sky. Through its own texture, so the holes still read and the spin still shows. Now 1.5 : 1 at worst (the milky south sky), 2.2+ elsewhere.
+  ballMesh.visible = false; scene.add(ballMesh);       // no real shadow: the blob below is the depth cue
+  const blob = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, color: 0x000000, map: glowTex(), polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }));
+  blob.rotation.x = -Math.PI / 2; blob.position.y = 0.02; blob.renderOrder = 3; blob.visible = false; scene.add(blob);
+  const ball = { p: [0, 1, 0], v: [0, 0, 0], live: false, stamp: 0, seen: false, snap: true, pos: new THREE.Vector3(0, 1, 0), vel: new THREE.Vector3(), lastBy: -1,
+    spin: 0, cool: 0, pulse: 0,                                      // backspin of a sliced ball (0..1) and the trail tint easing toward it
+    core: new THREE.Vector3(0, 1, 0), err: new THREE.Vector3(), errT: 1, errDur: 0.1, blend: false, ext: false, arc: null,
+    bounces: 0, kick: 0, curl: 0, held: false, w: null, tS: NaN, turn: null };   // what coast() needs beyond p and v; they ride on the state packet (w: a re-aim's bends, tS: the server t of p v). turn: the hit, for drawBall's blend
+  const clock = serverClock(), madeAt = clock.madeAt;   // pos = core (tracks the packets) + err (what is left of a correction, eased out)
+  const stampOf = t => (ball.ext ? lastMs : madeAt(t, performance.now()));      // ballTake(): a test driving updateBall on its own clock stamps everything with it
+  // attract: the endless rally behind the menus (docs/NEXT.md 11). All of it lives here: no server, no score, no sound.
+  const at = { on: false, t: 0, rnd: null, by: 0, p: [0, 1, 0], v: [0, 0, 0], t0: 0, spin: 0, kick: 0, n: 0, hitAt: 0, hitP: [0, 1, 0], swung: false,
+    run: [0, 1].map(() => ({ from: [0, 1, 0], to: [0, 1, 0], t0: 0, t1: 1, bh: false })), stats: { shots: 0, late: 0, out: 0, net: 9, gap: 0 } };
+
+  // Two ribbons: a wide additive halo (the glow) and a narrower core drawn with normal blending over it. Light added to a bright court or sky
+  // can only whiten it, so the halo alone read the same pale yellow at every power (and its smash came out LIGHTER than a drive); the core
+  // puts the real colour on top, so orange and red survive on the court and against the sky.
+  const TRAIL_N = 22, trail = { pts: [], acc: 0, glow: 0 }, trailC = [0, 0, 0];
+  const ribbon = (name, alpha, blending, order) => { const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TRAIL_N * 6), 3));
+    g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(TRAIL_N * (alpha ? 8 : 6)), alpha ? 4 : 3));
+    const idx = []; for (let i = 0; i < TRAIL_N - 1; i++) idx.push(i * 2, i * 2 + 1, i * 2 + 2, i * 2 + 1, i * 2 + 3, i * 2 + 2); g.setIndex(idx);
+    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, blending, depthWrite: false, side: THREE.DoubleSide, fog: false }));
+    m.name = name; m.frustumCulled = false; m.renderOrder = order; scene.add(m); return m; };
+  const trailMesh = ribbon('trail', false, THREE.AdditiveBlending, 1), trailGeo = trailMesh.geometry;
+  const coreMesh = ribbon('trailCore', true, THREE.NormalBlending, 2), coreGeo = coreMesh.geometry;
+
+  // ---------- fx pools: rings, sparks, landing marker ----------
+  const ringTex = canvasTex(128, 128, (c) => { c.strokeStyle = '#fff'; c.lineWidth = 9; c.beginPath(); c.arc(64, 64, 54, 0, 7); c.stroke(); });
+  const rings = [];
+  for (let i = 0; i < 8; i++) {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: ringTex, transparent: true, depthWrite: false, fog: false, side: THREE.DoubleSide }));
+    m.visible = false; m.renderOrder = 4; scene.add(m); rings.push({ m, t: 1, dur: 1, r0: 0, r1: 1, a: 1 });
+  }
+  const flashMat = new THREE.SpriteMaterial({ color: 0xffffff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false });
+  { const c = document.createElement('canvas'); c.width = c.height = 64; const x = c.getContext('2d'), g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.35, 'rgba(255,244,190,.75)'); g.addColorStop(1, 'rgba(255,220,120,0)'); x.fillStyle = g; x.fillRect(0, 0, 64, 64);
+    flashMat.map = new THREE.CanvasTexture(c); }
+  const flash = new THREE.Sprite(flashMat); flash.visible = false; scene.add(flash); let flashT = 0, flashS = 1;
+  const quiet = () => menu || at.on;                      // fx pools idle: no rings, bursts, flash, shake or marker behind a menu
+  function cameraPunch(n, x, share = 1) {
+    if (still || quiet() || !share) return;
+    const amount = (0.012 + 0.23 * clamp(n, 0, 1) ** 1.7) * share;
+    cam.shake = Math.max(cam.shake, Math.min(0.28, amount));
+    cam.kickX = clamp((x - cam.x) / 5, -1, 1) * amount * 0.28;
+    cam.kickY = -amount * 0.24;
+  }
+  function impactFrame(n) {
+    if (still || quiet() || n < 0.65) return;
+    impact.until = timeS + 0.025 + 0.012 * n; impact.strength = clamp(n, 0, 1);
+  }
+  function flashAt(p, size) { if (quiet()) return; flash.position.set(p[0], p[1], p[2]); flashT = 1; flashS = size; flash.visible = true; }
+  function updateFlash(dt) { if (flashT <= 0) return; flashT = Math.max(0, flashT - dt / 0.14); const k = 1 - flashT;
+    flash.scale.setScalar(flashS * (0.6 + 2.4 * k)); flashMat.opacity = flashT * flashT; if (flashT === 0) flash.visible = false; }
+  function ring(p, flat, r0, r1, dur, color, a = 1, additive = true) {
+    if (quiet()) return;
+    const r = rings.reduce((b, c) => (c.t / c.dur > b.t / b.dur ? c : b));
+    Object.assign(r, { t: 0, dur, r0, r1, a, flat }); r.m.visible = true; r.m.material.color.set(color);
+    r.m.material.blending = additive ? THREE.AdditiveBlending : THREE.NormalBlending;
+    r.m.position.set(p[0], flat ? 0.03 : p[1], p[2]);
+    if (flat) r.m.rotation.set(-Math.PI / 2, 0, 0);
+  }
+  const SPARKS = 120, sp = { p: new Float32Array(SPARKS * 3), c: new Float32Array(SPARKS * 3), v: new Float32Array(SPARKS * 3), life: new Float32Array(SPARKS), col: new Float32Array(SPARKS * 3), next: 0 };
+  const sparkGeo = new THREE.BufferGeometry();
+  sparkGeo.setAttribute('position', new THREE.BufferAttribute(sp.p, 3)); sparkGeo.setAttribute('color', new THREE.BufferAttribute(sp.c, 3));
+  const sparks = new THREE.Points(sparkGeo, new THREE.PointsMaterial({ size: 0.16, map: glowTex(), vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
+  sparks.frustumCulled = false; scene.add(sparks);
+  const rndFx = rng(99), tmpC = new THREE.Color(), tmpD = new THREE.Color();
+  function burst(p, n, count, speed, colors, dirZ = 0) {
+    if (quiet()) return;
+    for (let k = 0; k < count; k++) {
+      const i = sp.next = (sp.next + 1) % SPARKS, a = rndFx() * Math.PI * 2, e = (rndFx() - 0.3) * 1.6, s = speed * (0.4 + rndFx() * 0.8);
+      sp.p.set(p, i * 3); sp.v.set([Math.cos(a) * Math.cos(e) * s, Math.sin(e) * s + 1.2, Math.sin(a) * Math.cos(e) * s + dirZ], i * 3);
+      sp.life[i] = 0.26 + rndFx() * 0.26 + n * 0.12;
+      tmpC.set(colors[k % colors.length]); sp.col.set([tmpC.r, tmpC.g, tmpC.b], i * 3);
+    }
+  }
+  const markerTex = canvasTex(256, 256, (c) => {
+    c.strokeStyle = '#fff'; c.lineWidth = 14; c.beginPath(); c.arc(128, 128, 104, 0, 7); c.stroke();
+    c.lineWidth = 5; c.setLineDash([16, 12]); c.beginPath(); c.arc(128, 128, 70, 0, 7); c.stroke();
+    c.fillStyle = '#fff'; c.beginPath(); c.arc(128, 128, 16, 0, 7); c.fill();
+  });
+  const marker = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: markerTex, transparent: true, depthWrite: false, opacity: 0, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }));
+  marker.rotation.x = -Math.PI / 2; marker.position.y = 0.025; marker.renderOrder = 3; marker.visible = false; scene.add(marker);
+  const mk = { t: 9, fade: 0, by: -1, g: 1, from: [0, 0], to: [0, 0] };      // g: 0..1 along a glide from -> to (a re-aim moving the marker it already shows)
+
+  // ---------- paddles / avatars ----------
+  // Motion blur for the paddle: a ribbon swept between the throat and the tip of the face over the last few frames.
+  // Additive, so alpha lives in the vertex colour. Preallocated; nothing is created per frame.
+  const SW_N = 14;
+  function makeSwoosh(color) {
+    const g = new THREE.BufferGeometry(), pos = new Float32Array(SW_N * 2 * 3), col = new Float32Array(SW_N * 2 * 3), idx = [];
+    for (let i = 0; i < SW_N - 1; i++) { const a = i * 2; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.BufferAttribute(col, 3)); g.setIndex(idx);
+    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+    m.frustumCulled = false; m.visible = false; scene.add(m);
+    return { mesh: m, pos, col, n: 0, heat: 0, tint: new THREE.Color(color), lastTip: new THREE.Vector3(), lastQ: new THREE.Quaternion(), has: false };
+  }
+  const swTip = new THREE.Vector3(), swBase = new THREE.Vector3();
+  function updateSwoosh(sw, group, dt, swinging, force = 1) {
+    swTip.set(0, FACE_C * 2.05, 0).applyQuaternion(group.quaternion).add(group.position);
+    swBase.set(0, FACE_C * 0.35, 0).applyQuaternion(group.quaternion).add(group.position);
+    // Only a HARD swing blurs: the paddle itself must be whipping round (not just carried along by footwork, the
+    // camera-tracked body or the hit lunge), and its tip must really be travelling.
+    const speed = sw.has ? swTip.distanceTo(sw.lastTip) / Math.max(dt, 1e-3) : 0; sw.lastTip.copy(swTip);
+    const spinRate = sw.has ? 2 * Math.acos(Math.min(1, Math.abs(sw.lastQ.dot(group.quaternion)))) / Math.max(dt, 1e-3) : 0; sw.lastQ.copy(group.quaternion); sw.has = true;
+    // only while a swing is actually in progress (the 'swung' event opens a short window); harder swing = brighter
+    const want = swinging && spinRate > 7 && speed > 3 ? Math.min(1, 0.25 + (spinRate - 7) / 20) * (.25 + .75 * clamp(force, 0, 1)) : 0;
+    sw.heat += (want - sw.heat) * (want > sw.heat ? 0.5 : Math.min(1, dt * 16));
+    if (sw.heat < 0.06 && want === 0) sw.heat = 0;                               // no ghost line lingering after it fades
+    const P = sw.pos; P.copyWithin(6, 0, (SW_N - 1) * 6);                       // shift the history back one slot
+    P[0] = swBase.x; P[1] = swBase.y; P[2] = swBase.z; P[3] = swTip.x; P[4] = swTip.y; P[5] = swTip.z;
+    sw.n = Math.min(SW_N, sw.n + 1);
+    for (let i = 0; i < SW_N; i++) { const k = i < sw.n ? sw.heat * Math.pow(1 - i / SW_N, 1.6) * 0.5 : 0, o = i * 6;
+      if (i >= sw.n) { P[o] = P[o - 6]; P[o + 1] = P[o - 5]; P[o + 2] = P[o - 4]; P[o + 3] = P[o - 3]; P[o + 4] = P[o - 2]; P[o + 5] = P[o - 1]; }
+      sw.col[o] = sw.col[o + 3] = sw.tint.r * k; sw.col[o + 1] = sw.col[o + 4] = sw.tint.g * k; sw.col[o + 2] = sw.col[o + 5] = sw.tint.b * k; }
+    sw.mesh.visible = sw.heat > 0.06;
+    sw.mesh.geometry.attributes.position.needsUpdate = true; sw.mesh.geometry.attributes.color.needsUpdate = true;
+  }
+  const pads = [0, 1, 2, 3].map(side => {
+    const group = buildPaddle(side % 2), avatar = buildAvatar(side % 2);
+    const skinM = new THREE.MeshStandardMaterial({ color: COL.skin, roughness: 0.7 });
+    const hand = new THREE.Mesh(new THREE.SphereGeometry(0.072, 18, 14), skinM); hand.castShadow = true;
+    const ghostM = new THREE.MeshStandardMaterial({ color: COL.skin, roughness: 0.7, transparent: true, opacity: 0.32, depthWrite: false });
+    const forearm = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.062, 0.6, 14, 1, true).translate(0, -0.3, 0), ghostM);   // hangs from the hand along -y
+    const sleeveM = new THREE.MeshStandardMaterial({ color: COL.shirt[side % 2], transparent: true, opacity: 0.4, depthWrite: false });
+    const sleeve = new THREE.Mesh(new THREE.CylinderGeometry(0.066, 0.075, 0.14, 14, 1, true).translate(0, -0.62, 0), sleeveM);
+    forearm.add(sleeve); forearm.renderOrder = 5;
+    const tag = new THREE.Sprite(new THREE.SpriteMaterial({ transparent: true, depthTest: false, depthWrite: false, sizeAttenuation: false, toneMapped: false }));      // the status tag over the head: a billboard by nature (each split half faces its own camera), one size at any distance, over the scenery
+    tag.center.set(0.5, 0); tag.renderOrder = 50;
+    const nameTag = new THREE.Sprite(new THREE.SpriteMaterial({ transparent: true, depthTest: false, depthWrite: false, sizeAttenuation: false, toneMapped: false })); nameTag.center.set(0.5, 0); nameTag.renderOrder = 49;
+    for (const o of [group, avatar, hand, forearm, tag, nameTag]) { o.visible = false; scene.add(o); }
+    return { side, group, avatar, hand, forearm, tag, nameTag, nameFor: '', nameAspect: 3, status: null, tagFor: null, ghost: 0, mats: [], handM: skinM, ghostM, sleeveM, has: false, init: false, bot: false, matt: false, look: null,      // look: a LOOKS key from setLooks (the seat's registered username)      // bot: canned swing, no q. matt: Matt's look. Only the attract rally's side 0 has the first without the second
+      tgt: { x: 0, y: 1, z: sgn(side) * 6.5, q: new THREE.Quaternion(), off: null },
+      pos: new THREE.Vector3(0, 1, sgn(side) * 6.5), q: new THREE.Quaternion(), off: new THREE.Vector3(),
+      lunge: 0, reach: false, reachV: new THREE.Vector3(), hitP: [0, 1, 0], swingT: -1, swungAt: -9, mirror: 1, over: 0, raise: 0, bodyX: 0, bodyZ: sgn(side) * 6.8, vx: 0, vz: 0, cheer: 0, world: new THREE.Vector3(),
+      // stance: how far the head is off the baseline (duck / tip), the bob spring it is driving, and the dip counter behind the taunt
+      stance: { duck: 0, tip: 0, y0: STANCE.base, spring: 0, springV: 0, low: false, dips: 0, dipAt: -9, taunt: 0, gaze: 0, br: side * 2.2, puff: 0, by: STANCE.base, byV: 0, stride: 0, split: 0, look: 0 } };      // br: the breath's phase (the two seats out of step); puff: how winded, 0..1. by/byV, stride, split: Matt's body height, footsteps and split step (NOTES 170)
+  });
+  // Ultimate effects surround the original avatar and leave the paddle/ball clear.
+  // Pool the cube sparks so activation never allocates meshes during a rally.
+  const ENERGY_CUBES = 64, powerCube = new THREE.BoxGeometry(0.12, 0.12, 0.12), powerDummy = new THREE.Object3D();
+  const powerFx = pads.map(pd => {
+    const root = new THREE.Group(), boost = new THREE.Group(), slow = new THREE.Group(), win = new THREE.Group(); root.add(boost, slow, win); scene.add(root); root.visible = false;
+    const blue = new THREE.MeshBasicMaterial({ color: 0x38ddff, transparent: true, opacity: 0.78, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+    const violet = new THREE.MeshBasicMaterial({ color: 0xb95aff, transparent: true, opacity: 0.9, depthWrite: false, toneMapped: false });
+    const orange = new THREE.MeshBasicMaterial({ color: 0xffa331, transparent: true, opacity: 0.9, depthWrite: false, toneMapped: false });
+    const floor = new THREE.Mesh(new THREE.RingGeometry(0.72, 0.86, 4), blue); floor.rotation.x = -Math.PI / 2; floor.position.y = 0.04; boost.add(floor);
+    const cage = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1.28, 1.8, 1.28)), new THREE.LineBasicMaterial({ color: 0x65edff, transparent: true, opacity: 0.55, depthWrite: false, toneMapped: false })); cage.position.y = 1.12; boost.add(cage);
+    const motes = [], links = [];
+    for (let i = 0; i < 16; i++) { const m = new THREE.Mesh(powerCube, blue); boost.add(m); motes.push(m); }
+    const linkGeo = new THREE.TorusGeometry(0.14, 0.035, 4, 4);
+    for (let i = 0; i < 20; i++) { const m = new THREE.Mesh(linkGeo, i % 2 ? orange : violet); slow.add(m); links.push(m); }
+    const gold = new THREE.MeshBasicMaterial({color: 0xffd55f, transparent: true, opacity: .9, depthWrite: false, toneMapped: false, blending: THREE.AdditiveBlending});
+    const teamGlow = new THREE.MeshBasicMaterial({color: pd.side % 2 ? 0x5de9ff : 0xff799d, transparent: true, opacity: .6, depthWrite: false, toneMapped: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide});
+    const winFloor = new THREE.Mesh(new THREE.RingGeometry(.62, .86, 4), teamGlow); winFloor.rotation.x = -Math.PI / 2; winFloor.position.y = .05; win.add(winFloor);
+    const beam = new THREE.Mesh(new THREE.CylinderGeometry(.48, .85, 2.4, 8, 1, true), teamGlow); beam.position.y = 1.25; win.add(beam);
+    const crown = new THREE.Group(); crown.position.y = 2.35; win.add(crown);
+    const band = new THREE.Mesh(new THREE.CylinderGeometry(.27, .32, .14, 5, 1, true), gold); crown.add(band);
+    const crownTip = new THREE.ConeGeometry(.08, .2, 4);
+    for (let i = 0; i < 5; i++) { const a = i * Math.PI * 2 / 5, tip = new THREE.Mesh(crownTip, gold); tip.position.set(Math.sin(a) * .27, .13, Math.cos(a) * .27); crown.add(tip); }
+    const burstMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 1, depthWrite: false, toneMapped: false });
+    const cubes = new THREE.InstancedMesh(powerCube, burstMaterial, ENERGY_CUBES); cubes.visible = false; cubes.frustumCulled = false; scene.add(cubes);
+    const spikeMaterial = new THREE.MeshBasicMaterial({color:0xff7730,transparent:true,opacity:0,blending:THREE.AdditiveBlending,depthWrite:false,toneMapped:false,side:THREE.DoubleSide});
+    const spikeColumn = new THREE.Mesh(new THREE.CylinderGeometry(.06,.2,1,6,1,true),spikeMaterial); spikeColumn.visible=false; scene.add(spikeColumn);
+    pd.ultimateUntil = { boost: 0, slow: 0 };
+    return { root, boost, slow, win, crown, winFloor, beam, gold, teamGlow, floor, cage, motes, links, blue, violet, orange, cubes, spikeColumn, spikeUntil:0, burstAt: -9, burstDuration: 1.05, burstKind: '', pointUntil: 0, origin: [0, 1.1, 0], velocities: new Float32Array(ENERGY_CUBES * 3) };
+  });
+  function clearUltimates() {
+    for (const pd of pads) pd.ultimateUntil.boost = pd.ultimateUntil.slow = 0;
+    for (const fx of powerFx) { fx.root.visible = fx.cubes.visible = fx.spikeColumn.visible = false; fx.spikeUntil=0; fx.burstAt = -9; }
+  }
+  function clearCelebrations() { for (const fx of powerFx) { fx.pointUntil = 0; fx.win.visible = false; } }
+  function energyExplosion(pd, p, colors, kind, force = 1) {
+    if (quiet() || !pd) return;
+    const fx = powerFx[pd.side], motion = still ? .18 : 1;
+    fx.burstAt = timeS; fx.burstDuration = kind === 'point' ? 1.35 : kind === 'impact' || kind === 'spike' ? .58 : 1.05; fx.burstKind = kind;
+    fx.origin = [p[0], p[1], p[2]]; fx.cubes.visible = true;
+    for (let i = 0; i < fx.cubes.count; i++) {
+      const a = i * Math.PI * 2 / fx.cubes.count, speed = (2 + rndFx() * 3) * force * motion, j = i * 3;
+      fx.velocities[j] = Math.cos(a) * speed; fx.velocities[j + 1] = (kind==='spike' ? -1 : 1) * (2.4 + rndFx() * 3.4) * force * motion; fx.velocities[j + 2] = Math.sin(a) * speed;
+      tmpC.set(colors[i % colors.length]); fx.cubes.setColorAt(i, tmpC);
+    }
+    fx.cubes.instanceColor.needsUpdate = true;
+  }
+  function celebratePoint(team) {
+    for (const pd of pads) if (pd.has && pd.side % 2 === team) {
+      const fx = powerFx[pd.side], tint = team ? 0x5de9ff : 0xff799d, p = [pd.bodyX, 1.2, pd.bodyZ];
+      fx.pointUntil = timeS + 1.35; pd.cheer = still ? 0 : 1.18;
+      energyExplosion(pd, p, [0xffd55f, 0xffa73d, tint, 0xffffff], 'point', .85);
+      ring([p[0], .05, p[2]], true, .25, 3.5, .72, tint, .9);
+      ring([p[0], 1.1, p[2]], false, .1, 1.9, .62, 0xffd55f, .8);
+      flashAt([p[0], 1.4, p[2]], 1.35); burst([p[0], 2.0, p[2]], .8, 22, 2.3, [0xffd55f, tint, 0xffffff]);
+    }
+    cameraPunch(.34, 0, .5);
+  }
+  function ultimateBurst(pd, kind) {
+    if (quiet()) return;
+    const fx = powerFx[pd.side], colors = kind === 'boost' ? [0x38ddff, 0xa3ffff, 0xffffff] : [0xb95aff, 0xffa331, 0xffdaf4];
+    energyExplosion(pd, [pd.bodyX, 1.1, pd.bodyZ], colors, kind, .8); cameraPunch(.8, pd.bodyX, .65);
+    ring([pd.bodyX, 0.05, pd.bodyZ], true, 0.45, 2.5, 0.85, colors[0], 0.9);
+    ring([pd.bodyX, 1.15, pd.bodyZ], false, 0.15, 1.5, 0.65, colors[1], 0.7);
+  }
+  function updateUltimates() {
+    for (const pd of pads) {
+      const fx = powerFx[pd.side], boost = clamp(pd.ultimateUntil.boost - timeS, 0, 6), slow = clamp(pd.ultimateUntil.slow - timeS, 0, 6);
+      const point = clamp(fx.pointUntil - timeS, 0, 1.35);
+      fx.root.visible = pd.has && !quiet() && (boost > 0 || slow > 0 || point > 0); fx.boost.visible = boost > 0; fx.slow.visible = slow > 0; fx.win.visible = point > 0;
+      fx.root.position.set(pd.bodyX, 0, pd.bodyZ);
+      const t = still ? 0 : timeS, pulse = 0.92 + 0.08 * Math.sin(t * 7);
+      fx.blue.opacity = Math.min(1, boost / 0.4) * (0.6 + 0.18 * pulse); fx.violet.opacity = fx.orange.opacity = Math.min(1, slow / 0.4) * 0.88;
+      fx.floor.scale.setScalar(pulse); fx.floor.rotation.z = t * 0.7;
+      fx.cage.material.opacity = Math.min(1, boost / 0.4) * (0.28 + 0.22 * pulse); fx.cage.rotation.y = t * 0.45;
+      for (let i = 0; i < fx.motes.length; i++) { const m = fx.motes[i], a = i * Math.PI * 2 / fx.motes.length + t * 2.2, y = 0.35 + ((i / fx.motes.length + t * 0.35) % 1) * 1.9; m.position.set(Math.cos(a) * 0.75, y, Math.sin(a) * 0.75); m.rotation.set(t + i, t * 0.8, t * 1.4); m.scale.setScalar(0.8 + 0.35 * Math.sin(i + t * 4)); }
+      for (let i = 0; i < fx.links.length; i++) { const m = fx.links[i], a = i % 10 * Math.PI * 2 / 10 - t * 0.5; m.position.set(Math.cos(a) * 0.72, i < 10 ? 0.37 : 1.15, Math.sin(a) * 0.72); m.rotation.set(Math.PI / 2, i % 2 ? Math.PI / 2 : 0, a); }
+      fx.gold.opacity = Math.min(1, point / .28) * .9; fx.teamGlow.opacity = Math.min(1, point / .28) * .18;
+      fx.winFloor.scale.setScalar(1 + (1.35 - point) * .3); fx.winFloor.rotation.z = t * .5; fx.crown.rotation.y = t * 1.3;
+      fx.crown.position.y = 2.3 + pd.avatar.position.y + (still ? 0 : Math.sin(t * 8) * .06);
+      const age = timeS - fx.burstAt; fx.cubes.visible = pd.has && !quiet() && age >= 0 && age < fx.burstDuration;
+      const spike=clamp(fx.spikeUntil-timeS,0,.24);fx.spikeColumn.visible=pd.has&&!quiet()&&spike>0;fx.spikeColumn.material.opacity=(still?.16:.5)*spike/.24;
+      if (fx.cubes.visible) {
+        fx.cubes.material.opacity = (1 - age / fx.burstDuration) ** 1.2;
+        for (let i = 0; i < fx.cubes.count; i++) { const j = i * 3, v = fx.velocities; powerDummy.position.set(fx.origin[0] + v[j] * age, Math.max(.06, fx.origin[1] + v[j + 1] * age - (still ? .3 : 3.5) * age * age), fx.origin[2] + v[j + 2] * age); powerDummy.rotation.set((still ? 0 : age * 5) + i, (still ? 0 : age * 3) + i, still ? 0 : age * 4); powerDummy.scale.setScalar(.7 + (still ? 0 : age * .4)); powerDummy.updateMatrix(); fx.cubes.setMatrixAt(i, powerDummy.matrix); }
+        fx.cubes.instanceMatrix.needsUpdate = true;
+      }
+    }
+  }
+  // The winner's shot (NOTES 165; setVictory): the result is drawn on the court. The winner holds a trophy where the paddle was (its attitude is the
+  // paddle's own, so a phone or AirPod turns it), solid even when it is me, and one camera stands in front of them. pane: where the picture is
+  // free of the result panel, as fractions of the window and its centre in NDC (ui.resultPane); the lens goes off-axis so the winner sits in it.
+  const trophy = buildTrophy(); trophy.visible = false; scene.add(trophy);
+  const vicLight = new THREE.DirectionalLight(0xfff3dc, 0); scene.add(vicLight, vicLight.target);      // the shot's fill light, from the lens: side 0 faces away from the sun, and a winner's face in shade is no portrait. Always in the scene at 0 (a light added later recompiles every material)
+  const vic = { side: -1, t: 0, cx: 0, cz: 0, hopAt: 0, pane: { fw: 0.6, fh: 1, px: -0.4, py: 0 } };
+  const vicOn = () => vic.side >= 0 && !menu && !at.on;
+  const casters = []; for (const pd of pads) for (const o of [pd.group, pd.avatar, pd.hand]) o.traverse(m => { if (m.castShadow) casters.push(m); });
+  // ---------- seat status (docs/NEXT.md 14a): calibrating / paused / away. The character and its paddle go pale and see-through, a tag floats over the head ----------
+  // One tween value per pad (pd.ghost, 0.25 s each way) drives the SAME materials toward white: nothing is swapped, nothing is allocated per frame.
+  const WHITE = new THREE.Color(0xffffff), GLOW_GHOST = new THREE.Color(0.3, 0.3, 0.3), TAG_WORD = { calibrating: 'Calibrating', paused: 'Paused', away: 'Reconnecting' }, tagTex = {};
+  for (const pd of pads) { const seen = new Set(); for (const o of [pd.group, pd.avatar, pd.hand]) o.traverse(m => { if (m.isMesh) for (const mt of [].concat(m.material)) if (!seen.has(mt)) { seen.add(mt); pd.mats.push(mt); } }); rebase(pd); }      // (the paddle's face is a mesh with several materials)
+  function rebase(pd) { for (const m of pd.mats) { const b = m.userData.base; m.userData.base = { c: (b ? b.c : new THREE.Color()).copy(m.color), o: b ? b.o : m.opacity, t: b ? b.t : m.transparent, e: b ? b.e : m.emissive ? m.emissive.clone() : null }; } }   // the colours to come back to, taken once at build (paint() updates the ones it sets). e: the emissive, taken once (paint never changes it)
+  function ghostify(pd) {
+    const k = ease(pd.ghost);
+    for (const m of pd.mats) { const b = m.userData.base, t = b.t || k > 0 || pd.bodyM.has(m); m.color.copy(b.c).lerp(WHITE, 0.86 * k); if (b.e) m.emissive.copy(b.e).lerp(GLOW_GHOST, k); m.opacity = b.o * (1 - 0.5 * k) * (pd.self && pd.bodyM.has(m) ? SELF_A : 1); if (m.transparent !== t) { m.transparent = t; m.needsUpdate = true; } }
+  }
+  // Your own body, seen from behind it: there, but barely (SELF_A), so it never hides the ball or your paddle. Its materials stay
+  // `transparent` for good, so flipping between halves of a split each frame only moves opacity and depthWrite: no recompile.
+  // No depth write (the trail and the ball's glow show through it) and no shadow: a solid shadow under a ghost reads as a bug.
+  const SELF_A = 0.12; let selfBody = true;      // selfBody: Settings > Show player model. Off: the original look, your body hidden and the ghost forearm shown
+  for (const pd of pads) { pd.bodyM = new Set(); pd.self = false; pd.avatar.traverse(m => { if (m.isMesh) for (const mt of [].concat(m.material)) pd.bodyM.add(mt); }); ghostify(pd); }
+  function selfish(pd, on) {
+    if (pd.self === on) return; pd.self = on;
+    for (const m of pd.bodyM) m.depthWrite = !on;
+    pd.avatar.traverse(m => { if (m.isMesh) m.castShadow = !on; });
+    ghostify(pd);
+  }
+  function tagTexture(status) {                             // built once per status: a white pill, a small icon, ONE word
+    if (tagTex[status]) return tagTex[status];
+    const c = document.createElement('canvas'), W = c.width = 640, H = c.height = 160, g = c.getContext('2d'), tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+    const draw = () => {
+      g.clearRect(0, 0, W, H); g.font = '800 72px "Poddle Rounded", system-ui, sans-serif'; const word = TAG_WORD[status], tw = g.measureText(word).width, w = Math.min(W - 8, tw + 190), x0 = (W - w) / 2, r = 68;
+      g.beginPath(); g.roundRect(x0, 12, w, H - 24, r); g.fillStyle = 'rgba(255,255,255,.96)'; g.fill(); g.lineWidth = 6; g.strokeStyle = '#34beed'; g.stroke();
+      const ix = x0 + 78, iy = H / 2; g.strokeStyle = g.fillStyle = '#1c8fd0'; g.lineWidth = 11; g.lineCap = 'round';
+      if (status === 'paused') { g.beginPath(); g.roundRect(ix - 26, iy - 32, 19, 64, 7); g.roundRect(ix + 7, iy - 32, 19, 64, 7); g.fill(); }
+      else if (status === 'calibrating') { g.beginPath(); g.arc(ix, iy, 30, 0, 7); g.stroke(); g.beginPath(); g.arc(ix, iy, 9, 0, 7); g.fill(); g.beginPath(); for (const [dx, dy] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) { g.moveTo(ix + dx * 30, iy + dy * 30); g.lineTo(ix + dx * 42, iy + dy * 42); } g.stroke(); }
+      else { for (const rr of [50, 31]) { g.beginPath(); g.arc(ix, iy + 28, rr, -Math.PI * 0.76, -Math.PI * 0.24); g.stroke(); } g.beginPath(); g.arc(ix, iy + 24, 9, 0, 7); g.fill(); }      // a wifi mark
+      g.fillStyle = '#39434d'; g.textBaseline = 'middle'; g.fillText(word, x0 + 140, H / 2 + 5); tex.needsUpdate = true;
+    };
+    draw(); try { const f = '800 72px "Poddle Rounded"'; if (document.fonts && !document.fonts.check(f)) document.fonts.load(f).then(draw, () => {}); } catch (_) { /* the fallback font is fine */ }
+    return tagTex[status] = tex;
+  }
+  let vpW = 1, vpH = 1;                                     // the viewport being drawn (a half, in split): the tag's size is set in its pixels
+  const nameAnchor = new THREE.Vector3();
+  function setName(pd, value) {
+    const name = typeof value === 'string' ? value.trim().slice(0, 40) : '';
+    if (name === pd.nameFor) return;
+    pd.nameFor = name; pd.nameTag.userData.labelText = name;
+    if (pd.nameTag.material.map) pd.nameTag.material.map.dispose();
+    pd.nameTag.material.map = null;
+    if (name) {
+      const c = document.createElement('canvas'), g = c.getContext('2d'); g.font = '800 42px "Poddle Rounded", system-ui, sans-serif';
+      c.width = Math.min(640, Math.ceil(g.measureText(name).width + 50)); c.height = 80;
+      g.font = '800 42px "Poddle Rounded", system-ui, sans-serif'; g.beginPath(); g.roundRect(3, 7, c.width - 6, 65, 18); g.fillStyle = 'rgba(15,25,39,.84)'; g.fill();
+      g.strokeStyle = pd.side % 2 ? '#ffd05f' : '#ff8595'; g.lineWidth = 3; g.stroke();
+      g.textAlign = 'center'; g.textBaseline = 'middle'; g.lineWidth = 5; g.strokeStyle = '#14202c'; g.strokeText(name, c.width / 2, 42, c.width - 28); g.fillStyle = '#fff'; g.fillText(name, c.width / 2, 42, c.width - 28);
+      const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+      pd.nameTag.material.map = tex; pd.nameAspect = c.width / c.height;
+    }
+    pd.nameTag.material.needsUpdate = true;
+  }
+  function placeName(pd) {
+    pd.nameTag.visible = pd.has && pd.avatar.visible && !menu && !at.on && !!pd.nameFor;
+    if (!pd.nameTag.visible) return;
+    const e = camera.projectionMatrix.elements, px = clamp(vpH * 0.032, 19, 27);
+    pd.nameTag.scale.set(2 * px * pd.nameAspect / (vpW * e[0]), 2 * px / (vpH * e[5]), 1);
+    pd.avatar.updateMatrixWorld(true); pd.avatar.userData.head.getWorldPosition(nameAnchor);
+    pd.nameTag.position.set(nameAnchor.x, nameAnchor.y + 0.48, nameAnchor.z);
+  }
+  function placeTag(pd) {
+    const on = pd.avatar.visible && !pd.self && pd.ghost > 0.02 && !!pd.tagFor; pd.tag.visible = on; if (!on) return;
+    const e = camera.projectionMatrix.elements, px = clamp(vpH * 0.062, 34, 58);      // sizeAttenuation off: scale is NDC / lens, so pixels -> scale through the projection's own terms
+    pd.tag.scale.set(2 * px * 4 / (vpW * e[0]), 2 * px / (vpH * e[5]), 1); pd.tag.material.opacity = ease(pd.ghost);
+    pd.tag.position.set(pd.avatar.position.x, pd.avatar.position.y + 2.42, pd.avatar.position.z);
+  }
+  function paint(pd, matt) {                                // a seat changes hands between a person and Matt, or a named look (LOOKS) sits down: repaint, don't rebuild
+    pd.matt = matt; const u = pd.avatar.userData, m = matt ? COL.matt : null, L = !matt && !at.on && LOOKS[pd.look] || null, skin = L ? L.body : m ? m.skin : COL.skin, shirt = L ? L.body : m ? m.shirt : COL.shirt[pd.side % 2];      // Matt beats a look; the attract rally is nobody's
+    u.skin.color.setHex(skin); u.shirt.color.setHex(shirt); u.kit.color.setHex(L ? L.body : COL.kit); u.hairM.color.setHex(m ? m.hair : COL.hair[pd.side % 2]); for (const w of u.whites) w.visible = matt; u.hair.visible = !matt && !L; for (const e of u.eyes) e.visible = !matt && (!L || L.eyes); for (const o of u.mattFace) o.visible = matt; for (const k in u.looks) for (const o of u.looks[k]) o.visible = !!L && L === LOOKS[k];      // Matt is bald, with his own eyes; so are the named looks, with their own parts
+    pd.handM.color.setHex(skin); pd.ghostM.color.setHex(skin); pd.sleeveM.color.setHex(shirt);       // the hand on his paddle, and his forearm when a spectator looks through his eyes
+    for (const mt of [u.skin, u.shirt, u.kit, u.hairM, pd.handM]) mt.userData.base.c.copy(mt.color); if (pd.ghost > 0) ghostify(pd);      // only what paint set becomes the new base: a full rebase() while the seat is faded would keep every other part (eyes, paddle, band) white for good
+  }
+  // Whose eyes is the picture taken from? Their avatar is all but see-through (SELF_A) and their ghost forearm shown. -1: nobody's (broadcast, free, attract, a spectator's menu).
+  const eyeSide = () => (at.on || (spectator && (menu || vName !== 'pov')) ? -1 : spectator ? vSide : localSide);
+  const isMe = side => !spectator && !at.on && side === localSide;      // the 1:1 paddle and "my" sounds. A spectator has neither; both paddles are remote
+  function dress(eye, hideBack, hideSide) {                 // what this camera may see: per view, and per half in split
+    for (const pd of pads) { const mine = pd.side === eye; pd.avatar.visible = pd.has && (!mine || selfBody); selfish(pd, mine); pd.forearm.visible = pd.has && mine && !selfBody; placeTag(pd); placeName(pd); }      // a Mii has no arms: with the body shown, no forearm
+    for (let i = 0; i < 2; i++) { const b = i !== hideBack, s = i !== hideSide; for (const o of backFence[i]) o.visible = b; for (const o of sideFence[i]) o.visible = s; }
+  }
+  const E = new THREE.Euler(0, 0, 0, 'YXZ'), qA = new THREE.Quaternion(), vA = new THREE.Vector3(), vB = new THREE.Vector3(), vF = new THREE.Vector3(), UP = new THREE.Vector3(0, 1, 0), DOWN = new THREE.Vector3(0, -1, 0), e3 = [0, 0, 0], e4 = [0, 0, 0];
+  const D2R = Math.PI / 180;
+
+  function updatePads(dt) {
+    for (const pd of pads) {
+      const vis = pd.has, won = vis && vicOn() && vic.side === pd.side; pd.group.visible = vis && !won; pd.hand.visible = vis;             // avatar / forearm: dress(), once the camera is known. won: the trophy is in this hand, not the paddle
+      const want = pd.status && vis && !at.on ? 1 : 0; if (pd.ghost !== want) { pd.ghost = clamp(pd.ghost + (want ? dt : -dt) / 0.25, 0, 1); ghostify(pd); }      // whited out while calibrating / paused / away
+      if (!vis) continue;
+      const s = sgn(pd.side), local = isMe(pd.side), t = pd.tgt;
+      if (!pd.init) { pd.pos.set(t.x, t.y, t.z); pd.q.copy(t.q); pd.dr = null; pd.bodyX = t.x - s * BODY[0]; pd.bodyZ = t.z + s * BODY[1]; pd.init = true; }
+      // local paddle is 1:1 (only the server-stepped z gets a whisper of filtering); remote is 20Hz -> slerp/lerp
+      const kp = local ? 1 : damp(dt, 0.055);
+      pd.pos.x = lerp(pd.pos.x, t.x, kp); pd.pos.y = lerp(pd.pos.y, t.y, kp); pd.pos.z = lerp(pd.pos.z, t.z, damp(dt, local ? 0.03 : 0.06));
+      // Matt's paddle waits at his side (NOTES 175). runBot sends it straight up to a lob's contact height the moment he reads the ball, so
+      // on a slow lob he stood holding it over his head for a second. Drawn, it comes up only as the ball arrives (from 0.5 s out, all the
+      // way by 0.22 s, when the canned swing starts), stays up through the swing and goes back down after. Only up: a low ball's paddle is
+      // drawn where it is. `py` is the drawn height; the server's paddle, and so every hit, is untouched.
+      let py = pd.pos.y;
+      if (pd.bot) {
+        const ahead = -(ball.pos.z - pd.pos.z) * s, vz = ball.vel.z * s, k = clamp(((vz > 0.3 ? ahead / vz : 9) - 0.22) / 0.28, 0, 1);
+        const up = pd.swingT >= 0 || won ? 1 : ball.live && ball.lastBy !== pd.side && ahead > -0.3 ? 1 - k * k * (3 - 2 * k) : 0;
+        pd.raise = lerp(pd.raise, up, damp(dt, up > pd.raise ? 0.04 : 0.2));
+        const rest = Math.min(pd.pos.y, 1.1); py = rest + (pd.pos.y - rest) * pd.raise;
+      }
+      // Matt's hand also gets going and pulls up like a hand (NOTES 176). runBot moves his paddle at full foot speed from a standstill and
+      // stops it dead, and the 55 ms lerp above left it 0 -> 3 m/s in 0.12 s: a block on a rail. Drawn, x and z follow it on a critically
+      // damped spring, loose (w 11) while he runs, tight (w 40) for the last 0.3 s before the ball and through the swing, so the face is on
+      // the server's paddle by contact. Exact for a held target, so any frame rate gives the same path.
+      let px = pd.pos.x, pz = pd.pos.z;
+      if (pd.bot) {
+        if (!pd.dr) pd.dr = { x: pd.pos.x, z: pd.pos.z, vx: 0, vz: 0 };
+        const ahead = -(ball.pos.z - pd.pos.z) * s, vz = ball.vel.z * s, near = pd.swingT >= 0 || (ball.live && ball.lastBy !== pd.side && vz > 0.3 && ahead / vz < 0.3);
+        const D = pd.dr, om = lerp(11, 40, D.k = lerp(D.k || 0, near ? 1 : 0, damp(dt, near ? 0.03 : 0.25))), e = Math.exp(-om * dt);
+        for (const [k, kv, T] of [['x', 'vx', pd.pos.x], ['z', 'vz', pd.pos.z]]) { const d = D[k] - T, c = D[kv] + om * d; D[k] = T + (d + c * dt) * e; D[kv] = (D[kv] - om * c * dt) * e; }
+        if (Math.abs(D.x - pd.pos.x) > 1.5 || Math.abs(D.z - pd.pos.z) > 1.5) { D.x = pd.pos.x; D.z = pd.pos.z; D.vx = D.vz = 0; }      // a new point or a seat change: no gliding across the court
+        px = D.x; pz = D.z;
+      } else pd.dr = null;
+      if (pd.bot) {                                        // bots never send a q: idle sway + canned swing
+        if (won) pd.swingT = -1;
+        if (pd.swingT >= 0) { pd.swingT += dt * (pd.ultimateUntil.boost > timeS ? 1.35 : 1) * (pd.ultimateUntil.slow > timeS ? .45 : 1); if (pd.swingT > SWING[SWING.length - 1][0]) pd.swingT = -1; }
+        if (pd.swingT >= 0 && pd.swingT < SWING_CONTACT) pd.over = Math.max(pd.over, clamp((pd.pos.y - 1.55) / 0.45, 0, 1));      // the paddle may still be rising to a lob as the wind-up starts
+        if (pd.swingT >= 0) { swingEuler(pd.swingT, e3); if (pd.over > 0) { swingEuler(pd.swingT, e4, OVERHEAD); for (let j = 0; j < 3; j++) e3[j] = lerp(e3[j], e4[j], pd.over); } }
+        else { e3[0] = IDLE[0]; e3[1] = IDLE[1]; e3[2] = IDLE[2]; }
+        const br = Math.sin(timeS * 2.1 + pd.side);
+        if (won) E.set((-6 + Math.sin(timeS * 2.3) * 7) * D2R, Math.sin(timeS * 1.4) * 30 * D2R, Math.sin(timeS * 2.3 + 1) * 13 * D2R);      // Matt shows his cup off: it turns and tips, upright on average
+        else E.set((e3[1] + br * 2.5) * D2R, e3[0] * pd.mirror * D2R, (e3[2] * pd.mirror + br * 3) * D2R);
+        qA.setFromEuler(E);
+        if (pd.swingT >= 0) pd.q.copy(qA); else pd.q.slerp(qA, damp(dt, 0.08));
+      } else if (local) pd.q.copy(t.q); else pd.q.slerp(t.q, damp(dt, 0.045));
+      // swing-arc offset (player frame): given for the local player, else the kinematic arm of the SMOOTHED q
+      if (t.off && !pd.bot) pd.off.set(t.off[0], t.off[1], t.off[2]);
+      else {                                                   // high-passed: a held pose relaxes to no offset at all
+        const o = armOffset([pd.q.x, pd.q.y, pd.q.z, pd.q.w]), k = damp(dt, 0.35);
+        if (!pd.offRef) pd.offRef = [o[0], o[1], o[2]];
+        for (let i = 0; i < 3; i++) pd.offRef[i] += (o[i] - pd.offRef[i]) * k;
+        pd.off.set(o[0] - pd.offRef[0], o[1] - pd.offRef[1], o[2] - pd.offRef[2]);
+      }
+      pd.lunge = Math.max(0, pd.lunge - dt / 0.32);
+      const lg = Math.sin(Math.min(1, pd.lunge * 1.15) * Math.PI) * 0.2;       // out and back, gently
+      const w = pd.world.set(px + s * pd.off.x, Math.max(0.12, py + pd.off.y + lg * 0.12), pz + s * (pd.off.z - lg));
+      pd.group.quaternion.set(s * pd.q.x, pd.q.y, s * pd.q.z, pd.q.w);         // T*P*T^-1 for side 1
+      if (pd.reach) {                                      // just hit: the server's contact box is generous, so pull the FACE onto the ball for a beat
+        vA.set(0, FACE_C, 0).applyQuaternion(pd.group.quaternion).add(w);
+        pd.reachV.set(clamp(pd.hitP[0] - vA.x, -REACH_MAX, REACH_MAX), clamp(pd.hitP[1] - vA.y, -REACH_MAX, REACH_MAX), 0); pd.reach = false;
+      }
+      // ease INTO the ball over 3 frames and back out over the rest: a 1-frame snap read as the paddle clipping into a pose,
+      // 80 ms read as a late contact. Only the paddle eases: the ball, pop, burst and shake all start on the event's frame.
+      const ts = (1 - pd.lunge) * 0.32, rk = pd.lunge > 0 ? ease(Math.min(1, ts / 0.05)) * (1 - ease(ts / 0.32)) : 0;
+      w.x += pd.reachV.x * rk; w.y = Math.max(0.12, w.y + pd.reachV.y * rk);
+      if (won) { w.y += 0.34 * ease(Math.min(1, vic.t / 0.5)); trophy.position.copy(w); trophy.quaternion.copy(pd.group.quaternion); }      // held up at the shoulder, turned by the hand that holds it
+      pd.group.position.copy(w); pd.hand.position.copy(w);
+      if (!pd.swoosh) pd.swoosh = makeSwoosh(local ? 0xfff1c9 : 0xffd0b8);
+      updateSwoosh(pd.swoosh, pd.group, dt, !won && timeS < (pd.swooshUntil || 0), timeS < (pd.forceUntil || 0) ? pd.hitForce : 1);
+      if (local || spectator) {                            // ghost forearm: from the hand back toward a virtual elbow (a spectator may look through either player's eyes)
+        vA.set(pd.pos.x + s * 0.2, Math.max(0.2, pd.pos.y - 0.3), pd.pos.z + s * 0.72).sub(w).normalize();
+        pd.forearm.position.copy(w); pd.forearm.quaternion.setFromUnitVectors(DOWN, vA);
+      }
+      {                                                         // Mii stands so its right shoulder is the arm pivot: the paddle sweeps around the body, not through it (your own too: it is drawn, see-through, SELF_A)
+        // Serving: the body steps up to the hanging ball and turns to it, and the free hand cups it (below). Looks only: the server
+        // never sees a body, and the ball is drawn where it hangs, so the serve plays exactly as before.
+        const sd0 = pd.stance; sd0.hold = lerp(sd0.hold || 0, ball.heldBy === pd.side && ball.live && ballMesh.visible ? 1 : 0, damp(dt, ball.heldBy === pd.side ? 0.12 : 0.05));
+        const hold = ease(sd0.hold);
+        const bx = pd.pos.x - s * BODY[0] * (1 - 0.3 * hold), bz = pd.pos.z + s * BODY[1] - s * SERVE_STEP * hold, px = pd.bodyX, pz = pd.bodyZ;
+        pd.bodyX = lerp(pd.bodyX, bx, damp(dt, 0.12)); pd.bodyZ = lerp(pd.bodyZ, bz, damp(dt, 0.12));
+        pd.vx = lerp(pd.vx, (pd.bodyX - px) / Math.max(dt, 1e-3), damp(dt, 0.1));
+        pd.vz = lerp(pd.vz, (pd.bodyZ - pz) / Math.max(dt, 1e-3), damp(dt, 0.1));
+        if (won && !still && pd.cheer <= 0 && timeS >= vic.hopAt) { pd.cheer = 1.05; vic.hopAt = timeS + 3.6; }      // the winner cannot stand still: three little hops, now and again
+        pd.cheer = Math.max(0, pd.cheer - dt);
+        const hop = pd.cheer > 0 ? Math.abs(Math.sin(pd.cheer * 9)) * 0.28 : 0, run = Math.min(1, Math.abs(pd.vx) / 3);
+        const a = pd.avatar, u = a.userData, sd = pd.stance;
+        // ---------- read the body out of the head ----------
+        // pd.pos.y IS the head: in Body mode it is bodytrack's T.y(), and Auto and the bots drive the same number. Take it
+        // raw. It already carries a 20 Hz link and a 55 ms lerp, which is just slack enough to pass a three-a-second bob;
+        // another filter here would iron the bob flat, and the bob is half the point.
+        //
+        // Except Matt's (NOTES 170). His pos.y is only his PADDLE, driven straight to wherever the ball will be met, so read as a
+        // head a lob stood him up 0.7 m tall and every low ball folded him in half on the instant. His body takes its own height
+        // off the paddle: a low ball bends the knees most of the way down to it, a high one only brings him up onto his toes (the
+        // paddle, a Mii's floating hand, reaches the rest), and he gets there on a spring, sinking in and coming back up rather
+        // than riding the paddle 1:1. While a ball is in play the knees stay a little bent: the ready position.
+        const hdt = Math.min(dt, 0.033);
+        let hh = pd.pos.y;
+        if (pd.bot) {
+          const dpy = py - STANCE.base, want = STANCE.base - (ball.live && !won ? 0.05 : 0) + (dpy < 0 ? dpy * 0.8 : 0.12 * (1 - Math.exp(-dpy / 0.5)));      // off the DRAWN paddle: no tiptoe while it waits at his side
+          sd.byV += ((want - sd.by) * 110 - sd.byV * 21) * hdt; sd.by += sd.byV * hdt; hh = sd.by;      // critically damped (2 * sqrt 110)
+        }
+        const dy = hh - STANCE.base, duck = clamp(-dy / STANCE.duck, 0, 1), tip = clamp(dy / STANCE.rise, 0, 1);
+        const reach = clamp((dy - STANCE.rise) / STANCE.up, 0, 1);      // past a tiptoe it stops being one: the heels are already up, so the rest of the height has to come out of the body stretching for an overhead
+        const vy = (hh - sd.y0) / Math.max(dt, 1e-3); sd.y0 = hh;
+        // A knee spring driven by how fast the head is travelling, not by where it ended up: drop fast and the body squashes
+        // past its resting crouch, rise fast and it stretches past standing. That overshoot is what makes a quick bob read
+        // as a bounce rather than a slider being dragged, and it needs nothing to recognise a bob first.
+        sd.springV = clamp(sd.springV + ((clamp(-vy * 0.055, -0.16, 0.16) - sd.spring) * 190 - sd.springV * 17) * hdt, -6, 6);
+        sd.spring = clamp(sd.spring + sd.springV * hdt, -0.2, 0.2);
+        // Down, up, down again, three times inside a second each: the oldest joke in multiplayer, and the one thing here
+        // worth naming. Everything above already animates it; the taunt only turns the volume up so it plainly landed.
+        if (!sd.low && duck > 0.5) { sd.low = true; sd.dips = timeS - sd.dipAt < 1 ? sd.dips + 1 : 1; sd.dipAt = timeS; if (sd.dips >= 3 && !pd.bot) sd.taunt = 1; }      // Matt never taunts: his dips are low balls
+        else if (sd.low && duck < 0.2) sd.low = false;
+        sd.taunt = Math.max(0, sd.taunt - dt / 1.2);
+        sd.duck = duck; sd.tip = tip;
+        const lat = clamp(pd.vx * s / 2.6, -1, 1), fwd = clamp(-pd.vz * s / 1.8, -1, 1);      // player frame: + = to their own right, + = pressing toward the net
+        // ---------- breathing ----------
+        // Never quite still: the chest fills, the shoulders and head ride up on it, the chin lifts a touch, and it all lets
+        // go again, a little slower out than in. Effort winds it: running, lunging for a ball and the winner's hops push
+        // `puff` up, and a winded body breathes faster and deeper, then gets its wind back over about eight quiet seconds.
+        // Reduced motion keeps the calm breath and drops the heaving.
+        sd.puff = still ? 0 : clamp(sd.puff + (Math.max(run, pd.lunge * 1.6, pd.cheer > 0 ? 0.8 : 0) * 0.7 - 0.12) * dt, 0, 1);
+        sd.br += dt * Math.PI * 2 * (0.3 + 0.42 * sd.puff);
+        const inh = Math.pow(0.5 - 0.5 * Math.cos(sd.br + 0.3 * Math.sin(sd.br)), 1.3) * (1 + 1.3 * sd.puff);      // 0 = out; the warp makes the in-breath the quicker half, the power lingers at the bottom
+        // ---------- Matt's feet (NOTES 170) ----------
+        // A person tracks their own feet; Matt's used to slide while the whole body hopped at one fixed beat. Now the distance
+        // he covers turns a stride phase: one footstep per STRIDE metres, each foot lifting and reaching the way he is going
+        // in turn, and the body rising mid-step. The split step: as the other side hits, a little hop that lands in a dip,
+        // ready to push off. Reduced motion keeps the steps flat and skips the hop.
+        let gait = 0, bob = 0, splitUp = 0, splitDip = 0;
+        if (pd.bot) {
+          const sp = Math.hypot(pd.vx, pd.vz); gait = clamp((sp - 0.25) / 0.9, 0, 1) * (still ? 0 : 1);
+          sd.stride = gait > 0 ? sd.stride + sp * dt / STRIDE : Math.round(sd.stride);      // stopping, the feet come down where they are
+          bob = Math.abs(Math.sin(Math.PI * sd.stride)) * 0.035 * gait;
+          if (sd.split > 0) { const k = 1 - sd.split; splitUp = k < 0.45 ? Math.sin(Math.PI * k / 0.45) * 0.045 : 0; splitDip = k >= 0.45 ? Math.sin(Math.PI * (k - 0.45) / 0.55) * 0.07 : 0; sd.split = still ? 0 : Math.max(0, sd.split - dt / 0.38); }
+        }
+        // ---------- wear it ----------
+        const sink = duck * STANCE.sink + sd.spring * (1 + sd.taunt * 0.8) + splitDip, lift = tip * STANCE.toes + reach * 0.1;
+        a.position.set(pd.bodyX, hop + splitUp + (pd.bot ? bob : Math.abs(Math.sin(timeS * 11)) * 0.05 * run), pd.bodyZ);
+        a.rotation.set(0, (s > 0 ? 0 : Math.PI) - 0.4 * hold - lat * gait * 0.2, 0);      // and Matt turns a little into a run (NOTES 176), square again as he plants      // on the serve it turns a little toward the ball, out in front of the paddle
+        a.rotateZ(clamp(-pd.vx * s * 0.05, -0.22, 0.22)); a.rotateX(-0.06 - run * 0.08 - (pd.swingT >= 0 ? 0.1 : 0));      // the body's old whole-of-it lean, unchanged: it carries the feet with it, so it has to stay small
+        if (sd.taunt > 0) a.rotateY(Math.sin(timeS * 25) * sd.taunt * 0.1);
+        // Everything the stance adds bends at the waist instead. A crouch's forward lean is three times the old one, and
+        // swung about the root it would put the shoes through the paint; hinged here it leaves them flat where they stand.
+        // Matt swings from the waist (NOTES 176): his shoulders follow the paddle round, 0.45 of its turn off the idle pose: coiled away on
+        // the wind-up, square at contact, past on the follow-through, mirrored on a backhand (it rides on e3, the swing this frame). An
+        // overhead turns less and arches instead: back on the cock, forward through the ball. On `upper`, so the feet stay planted.
+        const swingOn = pd.bot && pd.swingT >= 0 && !won;
+        const twist = swingOn ? (e3[0] - IDLE[0]) * pd.mirror * D2R * 0.45 * (1 - 0.6 * pd.over) : 0, arch = swingOn ? (e3[1] - IDLE[1]) * D2R * 0.12 * pd.over : 0;
+        u.upper.rotation.set(-duck * STANCE.lean + tip * 0.07 - fwd * 0.1 + arch, twist, clamp(-pd.vx * s * 0.05, -0.22, 0.22) * duck * 0.9);
+        u.upper.position.y = lift - sink;
+        u.upper.scale.y = clamp(1 - duck * STANCE.squash + tip * 0.06 + reach * 0.14 - sd.spring * 0.5, 0.8, 1.35);
+        u.body.scale.set(1 + inh * 0.055, 1 + inh * 0.05, 1 + inh * 0.07);      // the chest swells most front to back
+        u.head.position.y = HEAD_Y + inh * 0.025;                                // the capsule's top rises 0.46 * its y swell: the head stays sat on it
+        u.offHand.position.set(-0.42 - duck * 0.13 - inh * 0.014, 0.85 + inh * 0.03 + hop * 0.6 - duck * 0.1 + tip * 0.16 + reach * 0.2, -0.12 - duck * 0.12);      // the free arm drops out and forward to balance a crouch, and reaches up on the toes
+        if (hold > 0.01) { a.updateMatrixWorld(true); vA.copy(ballMesh.position); vA.y -= BALL_R + 0.08; u.upper.worldToLocal(vA); u.offHand.position.lerp(vA, hold); }      // the hand under the ball, palm up (the Mii's hand floats, so it can reach)
+        // Feet: the stance widens as the knees bend, and the foot in the direction of travel takes the step while the other
+        // trails. That stagger is what separates a lunge from a squat — the sink cannot do it, because the shoes would be
+        // through the paint long before a 0.7 m duck read as one.
+        const step = lat * (0.07 + duck * 0.2), shuf = fwd * (0.05 + duck * 0.12);
+        for (let i = 0; i < 2; i++) {
+          const sx = i ? 1 : -1, f = u.feet[i], ld = sx * step >= 0;
+          f.position.set(sx * (0.15 + duck * 0.09) + step * (ld ? 1 : 0.3), 0.065, -0.04 - shuf + (ld ? -1 : 1) * Math.abs(step) * 0.3);
+          f.rotation.set(-tip * 0.55, step * 0.8, 0);                                        // on the toes the heels come up; a step turns the shoe to point the way
+          // and then the shoe is put back down on the paint. Its lowest point moves with all three of the ankle's tilt (the
+          // blob is long in z, so tipping it reaches further down), the body's roll and the body's lean, and a lunging foot
+          // is far enough out from the root that the roll alone would scuff it through the court. Solving for it here is
+          // also what makes a tiptoe pivot on the toes: without it the whole foot just floats, and it reads as a small jump.
+          vF.set(f.position.x, f.position.y, f.position.z).applyQuaternion(a.quaternion);
+          f.position.y += Math.max(0, Math.hypot(0.066 * Math.cos(f.rotation.x), 0.165 * Math.sin(f.rotation.x)) - vF.y);
+          if (gait > 0) { const up = Math.max(0, (i ? -1 : 1) * Math.sin(Math.PI * sd.stride)) * gait; f.position.y += up * 0.075; f.position.x += lat * up * 0.07; f.position.z -= fwd * up * 0.07; }      // Matt's stepping foot: up, and toward where he is going
+        }
+        if (won) {                                         // the winner looks into the lens
+          const dx = (camera.position.x - pd.bodyX) * s, dz = Math.max(0.5, (pd.bodyZ - camera.position.z) * s);
+          sd.look = lerp(sd.look, clamp(-Math.atan2(dx, dz), -0.8, 0.8), damp(dt, 0.12)); sd.gaze = lerp(sd.gaze, 0, damp(dt, 0.12));
+        } else if (ball.seen) {                            // head tracks the ball, from wherever the crouch has actually left it
+          const hy = a.position.y + (u.upper.position.y + u.head.position.y * u.upper.scale.y) * 1.3;
+          const dx = (ballMesh.position.x - pd.bodyX) * s, dz = Math.max(0.5, (pd.bodyZ - ballMesh.position.z) * s);
+          sd.look = lerp(sd.look, clamp(-Math.atan2(dx, dz), -0.8, 0.8), damp(dt, 0.12));
+          sd.gaze = lerp(sd.gaze, clamp(Math.atan2(ballMesh.position.y - hy, dz + 2) * 0.8, -0.3, 0.5), damp(dt, 0.12));
+        }
+        u.head.rotation.y = clamp(sd.look - twist + lat * gait * 0.2, -1.2, 1.2);      // the look is kept in the body's square frame: the swing's twist and the run's turn are taken back off, so the eyes stay on the ball
+        // A crouch bends at the waist, and the neck gives most of it straight back: nobody drops into a ready position and
+        // stares at their own shoes. Without this the deep crouch turned the face away from the camera entirely and the
+        // player opposite was reading the top of a head. The gaze is smoothed on its own so the lean can be taken off it
+        // every frame without the correction compounding into the lerp.
+        u.head.rotation.x = clamp(sd.gaze - u.upper.rotation.x * 0.8 - inh * 0.045, -0.35, 0.75);      // and the chin lifts a touch on the in-breath
+        u.head.rotation.z = sd.taunt > 0 ? Math.sin(timeS * 25 + 1) * sd.taunt * 0.16 : lerp(u.head.rotation.z, 0, damp(dt, 0.15));
+      }
+      // bots: start the wind-up just before the ball arrives so contact lands mid-sweep
+      if (pd.bot && pd.swingT < 0 && !frozen && !at.on && ball.live && ball.lastBy !== pd.side && ball.vel.z * s > 0.5) {      // attract times its own swings; a paused ball is not arriving
+        const ahead = -(ball.pos.z - pd.pos.z) * s, tc = (ahead - 0.7) / Math.abs(ball.vel.z);
+        if (ahead > 0 && tc < SWING_CONTACT && Math.abs(ball.pos.x - pd.pos.x) < 1.5) startSwing(pd);
+      }
+    }
+  }
+  function startSwing(pd, at = 0) {
+    pd.swingT = at; pd.mirror = (ball.pos.x - pd.pos.x) * sgn(pd.side) < -0.25 ? -1 : 1;     // ball on their left -> backhand
+    pd.over = clamp((Math.max(pd.pos.y, pd.tgt.y) - 1.55) / 0.45, 0, 1);                    // a ball over his head: the overhead
+  }
+
+  function updateBallVis(now, dt) {
+    const b = ball;
+    if (!b.seen) { spinW = 0; return; }                   // hidden (hideBall): no stale swirl when it comes back
+    if (frozen && !at.on) {                                // paused, or a seat is held: the ball stays where it is drawn. No coast, no hover, no blend, no new trail points
+      if (!ballMesh.visible && b.live) { b.pos.set(b.p[0], Math.max(BALL_R, b.p[1]), b.p[2]); b.core.copy(b.pos); b.errT = 1; ballMesh.position.copy(b.pos); blob.position.set(b.pos.x, 0.02, b.pos.z); ballMesh.visible = blob.visible = trailMesh.visible = true; }   // joined a paused room: the packet is where it hangs
+      return;
+    }
+    if (at.on) { coast(b.pos, b.vel, at.p, at.v, at.t - at.t0, at.spin, 0, at.kick); b.core.copy(b.pos); b.errT = 1; }      // one closed-form flight from the last contact: it cannot drift
+    else if (b.netHit) {
+      const n = b.netHit; n.age += dt;
+      coast(b.pos, b.vel, n.p, n.v, Math.max(0, n.age - .055), 0, 0, 0);
+      b.core.copy(b.pos); b.errT = 1;
+    } else if (b.live) {
+      const far = pads[1 - localSide % 2];
+      if (drawBall(b, vA, now, dt, far && far.has ? far.pos.z : 0)) trail.pts.length = 0;
+      const contact = netIntercept(b, clamp((now - b.stamp) / 1000, 0, COAST_MAX), court);
+      if (contact) { b.pos.set(...contact); b.core.copy(b.pos); b.vel.set(0, 0, 0); b.errT = 1; b.arc = null; trail.pts.length = 0; }
+    } else {                                               // rally over: let it bounce away on its own
+      b.vel.y -= G * dt; b.pos.addScaledVector(b.vel, dt);
+      if (b.pos.y < BALL_R) { b.pos.y = BALL_R; b.vel.y = Math.abs(b.vel.y) * 0.6; b.vel.x *= 0.75; b.vel.z *= 0.75; if (b.vel.y < 0.6) b.vel.y = 0; }
+    }
+    ballMesh.visible = blob.visible = true; trailMesh.visible = !b.netHit; ballMesh.position.copy(b.pos);
+    if (b.pulse > 0) { b.pulse = Math.max(0, b.pulse - dt / 0.16); ballMesh.scale.setScalar(1 + 0.9 * b.pulse * b.pulse); } else ballMesh.scale.setScalar(1);
+    const sp2 = Math.hypot(b.vel.x, b.vel.z);
+    // rolls the way it flies; a sliced ball visibly spins BACKWARDS, and fast
+    // 60 rad/s at 60 fps is ~1 rad a frame on a ball with a regular hole pattern: it strobes and reads as NOT spinning.
+    // So backspin is drawn slower than life (~3 turns a second), and a swirl of wind whips around the ball with it.
+    if (sp2 > 0.05) { vB.set(b.vel.z, 0, -b.vel.x).normalize(); ballMesh.rotateOnWorldAxis(vB, lerp(Math.min(sp2 / BALL_R * 0.35, 40), -19, b.spin) * dt); }
+    serveA = b.live && b.held && !at.on ? Math.min(1, serveA + dt / 0.25) : Math.max(0, serveA - dt / 0.12);     // gone almost at once when it is struck
+    serveFx.visible = serveA > 0;
+    if (serveFx.visible) { const k = 0.5 - 0.5 * Math.cos(timeS * Math.PI * 2 * 1.2); serveFx.position.copy(b.pos); serveRoll -= 1.6 * dt; serveFx.scale.setScalar(1.05 + 0.2 * k); serveMat.opacity = serveA * (0.85 + 0.15 * k); }     // turning gently, breathing out and in 1.2 times a second, brightest when widest
+    {                                                      // the swirl: what the spin will do to the first bounce, from the same numbers coast() bounces with
+      const spin = at.on ? at.spin : b.spin, kick = at.on ? at.kick : b.kick, cut = (SPUN.along - FLOOR.along) * spin;
+      if (at.on) { if (at.t0 !== swHit) { swHit = at.t0; swLanded = false; } if (b.pos.y <= BALL_R + 1e-3) swLanded = true; }     // attract has no bounce count: watch the floor
+      const dx = b.vel.x * cut + kick, dz = b.vel.z * cut, D = Math.hypot(dx, dz), on = b.live && !b.held && !(at.on ? swLanded : b.bounces > 0) && spin > 0.02;
+      if (on && D > 0.05) spinAxis.set(dz / D, 0, -dx / D);     // up x D
+      spinW += ((on ? clamp(D / 4, 0, 1) : 0) - spinW) * damp(dt, 0.08);
+      spinFx.position.copy(b.pos); spinFx.visible = spinW > 0.05 && serveA === 0;     // the serve cue goes first (0.12 s), then the swirl comes in
+      if (spinFx.visible) { spinRoll = (spinRoll + (5 + 13 * spinW) * dt) % (Math.PI * 2); updateSpinFx(spinW, timeS); spinMat.opacity = Math.min(1, spinW * 5) * (0.45 + 0.5 * spinW); }
+    }
+    const h = b.pos.y - BALL_R, k = 1 / (1 + h * 0.55);
+    blob.position.set(b.pos.x, 0.02, b.pos.z); blob.scale.setScalar(0.22 + 0.36 * k); blob.material.opacity = 0.35 + 0.5 * k;
+    // ribbon trail, camera-facing
+    b.cool += ((b.live && !b.held ? b.spin : 0) - b.cool) * damp(dt, 0.08);
+    if (b.betN != null && timeS > b.betUntil) { b.power = b.betN; b.betN = null; }      // no settled re-aim came: the ball really flies at the bet, show it
+    b.hot = (b.hot || 0) + ((b.live ? b.power || 0 : 0) - (b.hot || 0)) * damp(dt, 0.05);      // a hit sets it outright (onEvent); this only glides a re-aim, and cools it when the rally is over
+    if (b.live && b.hot > SMASH_N) { b.ember = (b.ember || 0) + dt;      // embers and the fat flame are the smash's own (they started at n 0.55-0.6, the OLD smash line: drives at 21-27 rad/s wore them too)
+      if (b.ember > 0.028) { b.ember = 0; burst([b.pos.x, b.pos.y, b.pos.z], 0.2, 3, 1.6, [0xff5a1f, 0xffb340, 0xfff0a0]); } }
+    trail.glow = Math.max(b.live ? 0.55 + 0.35 * trailHeat(b.hot) : 0, trail.glow - dt * 1.6); trail.acc += dt;
+    if (trail.acc >= 1 / 90) { trail.acc = 0; trail.pts.unshift(b.pos.clone()); if (trail.pts.length > TRAIL_N) trail.pts.pop(); }
+  }
+  const lin = c => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);   // vertex colours are linear (the renderer writes sRGB): unconverted, the ramp's orange drew as pale amber and its red as salmon
+  function drawTrail() {                                   // after the camera is posed (twice a frame in split: each half gets a ribbon that faces ITS camera)
+    const b = ball; coreMesh.visible = trailMesh.visible; if (!trailMesh.visible) return;
+    const P = trailGeo.attributes.position.array, C = trailGeo.attributes.color.array, PC = coreGeo.attributes.position.array, CC = coreGeo.attributes.color.array, n = trail.pts.length;
+    // one colour per shot, the heat of its power: white tap -> yellow -> orange -> red smash (trailHeat spreads the powers people really swing over it)
+    const h = b.hot || 0, t = trailHeat(h), fire = Math.max(0, (h - SMASH_N) / (1 - SMASH_N)), c = trailRamp(t, trailC), boost = 1 + 0.9 * fire;   // fire: 0 below smash power, 1 at full
+    const r = lin(c[0]), g = lin(c[1]), bl = lin(c[2]), core = clamp(0.35 + 0.65 * trail.glow, 0, 1);
+    for (let i = 0; i < TRAIL_N; i++) {
+      const p = trail.pts[Math.min(i, n - 1)] || b.pos, q = trail.pts[Math.min(i + 1, n - 1)] || p, f = i < n ? 1 - i / TRAIL_N : 0;
+      vA.subVectors(p, q); vB.subVectors(camera.position, p); vA.cross(vB); if (vA.lengthSq() < 1e-10) vA.set(0, 0, 0); else vA.normalize();
+      const lick = fire * (0.75 + 0.25 * Math.sin(timeS * 47 + i * 1.9)), wh = BALL_R * (0.85 + 0.6 * t + 1.5 * lick) * f, wc = BALL_R * (0.42 + 0.3 * t + 0.9 * lick) * f;   // harder = wider; a smash drags a fat, licking flame
+      P[i * 6] = p.x + vA.x * wh; P[i * 6 + 1] = p.y + vA.y * wh; P[i * 6 + 2] = p.z + vA.z * wh; P[i * 6 + 3] = p.x - vA.x * wh; P[i * 6 + 4] = p.y - vA.y * wh; P[i * 6 + 5] = p.z - vA.z * wh;
+      PC[i * 6] = p.x + vA.x * wc; PC[i * 6 + 1] = p.y + vA.y * wc; PC[i * 6 + 2] = p.z + vA.z * wc; PC[i * 6 + 3] = p.x - vA.x * wc; PC[i * 6 + 4] = p.y - vA.y * wc; PC[i * 6 + 5] = p.z - vA.z * wc;
+      const a = f * f * trail.glow * 0.7 * boost, ac = Math.pow(f, 1.2) * core;     // halo: added light, soft; core: the colour itself, over whatever is behind it
+      for (let j = 0; j < 2; j++) { const k = i * 6 + j * 3, kc = i * 8 + j * 4;
+        C[k] = r * a; C[k + 1] = g * a; C[k + 2] = bl * a; CC[kc] = r; CC[kc + 1] = g; CC[kc + 2] = bl; CC[kc + 3] = ac; }
+    }
+    trailGeo.attributes.position.needsUpdate = trailGeo.attributes.color.needsUpdate = coreGeo.attributes.position.needsUpdate = coreGeo.attributes.color.needsUpdate = true;
+  }
+
+  function faceFx() { for (const r of rings) if (r.m.visible && !r.flat) r.m.quaternion.copy(camera.quaternion); }      // per camera, like the trail
+  function stopFx() {                                      // a menu came up: nothing may hang in the air behind it, or pop back when it goes
+    clearUltimates(); clearCelebrations(); clearNet();
+    for (const r of rings) { r.m.visible = false; r.t = r.dur; } sp.life.fill(0); sp.c.fill(0); sparkGeo.attributes.color.needsUpdate = true;
+    flashT = 0; flash.visible = false; marker.visible = false; cam.shake = cam.kickX = cam.kickY = 0; impact.until = -9; renderer.domElement.style.filter = ''; ball.pulse = 0;
+  }
+  function updateFx(dt) {
+    updateFlash(dt);
+    for (const r of rings) {
+      if (!r.m.visible) continue;
+      r.t += dt; const k = r.t / r.dur; if (k >= 1) { r.m.visible = false; continue; }
+      r.m.scale.setScalar(lerp(r.r0, r.r1, 1 - (1 - k) ** 3) * 2); r.m.material.opacity = r.a * (1 - k) ** 1.5;
+    }
+    for (let i = 0; i < SPARKS; i++) {
+      const j = i * 3;
+      if (sp.life[i] <= 0) { sp.c[j] = sp.c[j + 1] = sp.c[j + 2] = 0; continue; }
+      sp.life[i] -= dt; sp.v[j + 1] -= G * 0.7 * dt;
+      for (let a = 0; a < 3; a++) { sp.v[j + a] *= 1 - 3.4 * dt; sp.p[j + a] += sp.v[j + a] * dt; }
+      if (sp.p[j + 1] < 0.03) { sp.p[j + 1] = 0.03; sp.v[j + 1] *= -0.4; }
+      const f = clamp(sp.life[i] / 0.3, 0, 1); for (let a = 0; a < 3; a++) sp.c[j + a] = sp.col[j + a] * f;
+    }
+    sparkGeo.attributes.position.needsUpdate = sparkGeo.attributes.color.needsUpdate = true;
+    if (marker.visible) {
+      mk.t += dt; if (mk.fade > 0) mk.fade += dt;
+      if (mk.g < 1) { mk.g = Math.min(1, mk.g + dt / 0.2); const k = ease(mk.g); marker.position.x = lerp(mk.from[0], mk.to[0], k); marker.position.z = lerp(mk.from[1], mk.to[1], k); }
+      const a = Math.min(1, mk.t / 0.12) * (mk.fade > 0 ? 1 - mk.fade / 0.3 : 1) * (mk.t > 2.2 ? Math.max(0, 1 - (mk.t - 2.2) / 0.5) : 1);
+      if (a <= 0) marker.visible = false;
+      marker.material.opacity = a * 0.85; marker.scale.setScalar(1.15 + Math.sin(mk.t * 9) * 0.07 + Math.max(0, 0.6 - mk.t * 3)); marker.rotation.z = mk.t * 1.4;
+    }
+  }
+
+  // Head-coupled perspective (the Johnny Lee Wii-remote trick): the screen is a window onto the court. The window is a
+  // fixed rectangle through the court centre, square to the locked-off view; the eye slides with the player and the
+  // frustum goes off-axis so the window stays put. The net and far court never move on screen, near things shift
+  // against the eye, and the paddle stays well inside the frame at the sideline.
+  function spring(o, k, vk, target, tau, dt) {             // critically damped follow (no overshoot, no allocations)
+    const w = 2 / tau, x = w * dt, e = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x), c = o[k] - target, tmp = (o[vk] + w * c) * dt;
+    o[vk] = (o[vk] - w * tmp) * e; o[k] = target + (c + tmp) * e;
+  }
+  const fovFor = (base, aspect) => (aspect < 1.2 ? lerp(Math.max(74, base), base, clamp((aspect - 0.5) / 0.7, 0, 1)) : base);   // keep the court in frame on tall windows (and in each tall half of a split)
+  const povSt = [0, 1, 2, 3].map(() => ({ x: 0, y: 0, vx: 0, vy: 0, z: 0, cut: true }));      // a spectator looking through a player's eyes: that seat's own smoothed offset + run-back
+  // The play camera, for any seat. st: that seat's smoothed state (the seated player's is `view`). viewer: honour setViewer() (the seated player only).
+  function playPose(side, st, aspect, viewer, dt) {
+    const s = sgn(side), me = pads[side];
+    camera.aspect = aspect; camera.fov = fovFor(cam.fovBase, aspect);
+    // viewer offset: setViewer() while it is fresh, else wherever that paddle stands
+    let tx = 0, ty = 0;
+    if (viewer && timeS - view.at < 0.5) { tx = view.inX; ty = view.inY; }
+    else if (me.has) { tx = me.pos.x * s / court.halfW; ty = (me.pos.y - 1) / 1.3; }
+    // the server runs you back for deep balls (up to ~2 m behind the baseline). The camera goes with you, or the
+    // paddle drops off the bottom of the screen exactly when the ball arrives.
+    const back = me.has ? me.pos.z * s - 6.5 : 0, bz = back > 0 ? back : back * 0.5;
+    if (st.cut) { st.cut = false; st.x = clamp(tx, -1, 1); st.y = clamp(ty, -1, 1); st.vx = st.vy = 0; st.z = bz; }      // changing view is a cut: no slide in from the last pose
+    spring(st, 'x', 'vx', clamp(tx, -1, 1), VIEW.tau, dt); spring(st, 'y', 'vy', clamp(ty, -1, 1), VIEW.tau, dt);
+    st.z = lerp(st.z || 0, bz, damp(dt, 0.18));
+    const k = cam.shake, t = timeS * 1000;
+    // locked-off pose (+ shake): fixes the view direction and the window
+    camera.position.set(Math.sin(t * 0.093) * k + cam.kickX, 3.1 + Math.sin(t * 0.117 + 1) * k * 0.8 + cam.kickY, s * (court.halfL + 5.4 + (st.z || 0)) + Math.sin(t * 0.071 + 2) * k * 0.5);
+    vB.set(0, 0.35, s * (0.4 + (st.z || 0) * 0.6)); camera.lookAt(vB);
+    // window = the net plane: depth of the net's centre along the view axis (the look target itself moves with the run-back)
+    const D = vB.set(0, court.net / 2, 0).sub(camera.position).dot(vA.set(0, 0, -1).applyQuaternion(camera.quaternion)), hh = D * Math.tan(camera.fov * D2R / 2), hw = hh * camera.aspect;
+    // slide the eye in the camera's own axes (side 1's right is world -x, which the camera's right already is);
+    // far offside it also drifts back so the whole near court still fits beside the paddle
+    const g = VIEW_PARALLAX, ex = st.x * VIEW.x * g * clamp(hw / 8, 0.4, 1),   // less sideways travel through a narrow window
+      ey = st.y * VIEW.y * g, eb = st.x * st.x * VIEW.back * g;
+    camera.position.add(vA.set(1, 0, 0).applyQuaternion(camera.quaternion).multiplyScalar(ex));
+    camera.position.add(vA.set(0, 1, 0).applyQuaternion(camera.quaternion).multiplyScalar(ey));
+    camera.position.add(vA.set(0, 0, 1).applyQuaternion(camera.quaternion).multiplyScalar(eb));
+    if (viewer) cam.x = camera.position.x;
+    const n = camera.near / (D + eb);
+    camera.projectionMatrix.makePerspective((-hw - ex) * n, (hw - ex) * n, (hh - ey) * n, (-hh - ey) * n, camera.near, camera.far);
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+  }
+  const shaken = (x, y, z) => { const k = cam.shake, t = timeS * 1000; camera.position.set(x + Math.sin(t * 0.093) * k + cam.kickX, y + Math.sin(t * 0.117 + 1) * k * 0.8 + cam.kickY, z + Math.sin(t * 0.071 + 2) * k * 0.5); };
+  function lens(fov, aspect) { camera.aspect = aspect; camera.fov = fov; camera.updateProjectionMatrix(); }
+  // Broadcast: side-on from beyond the +x net post, so side 0 (+z) is on screen LEFT, like the spectator scoreboard.
+  function broadcastPose(aspect) {
+    const X = court.halfW + 10, Y = 5.5; let fov = 38;
+    shaken(X, Y, still ? 0 : Math.sin(timeS / 6.1) * 0.3);
+    for (let i = 0; i < 2; i++) {                          // narrow window: widen until both players' run-off is in frame, and lift the gaze so the frame's foot stays on the apron
+      const down = Math.min(Math.atan2(Y - 0.8, X), (40 - fov / 2) * D2R); camera.lookAt(vB.set(0, Y - Math.tan(down) * X, 0)); camera.updateMatrixWorld();      // (past 40 deg down it would stare into the planting under the lens)
+      let need = 0; for (const z of [-1, 1]) { vA.set(court.halfW / 2, 1, z * (court.halfL + 2)).applyMatrix4(camera.matrixWorldInverse); need = Math.max(need, Math.abs(vA.x) / -vA.z); }
+      fov = clamp(2 * Math.atan(need * 1.06 / aspect) / D2R, 38, 100);
+    }
+    lens(fov, aspect);
+  }
+  // Free: orbit (0, 0.9, tz). Above the ground, never inside a fence's thickness. Returns nothing; freeHide() says which panels stand in the way.
+  // The lower the camera, the shorter its leash: 30 m out at 6 degrees it stood in the street with a parked car under the lens, a palm trunk down the middle and the hedge across the court.
+  const freeMax = () => lerp(16, 30, clamp((free.pitch - 6) / 14, 0, 1));
+  function freePose(aspect) {
+    if (!isFinite(free.yaw + free.pitch + free.dist + free.tz)) { free.yaw = 20; free.pitch = 25; free.dist = 17; free.tz = 0; }
+    free.pitch = clamp(free.pitch, 6, 80); free.dist = clamp(free.dist, 6, freeMax()); free.yaw = ((free.yaw % 360) + 360) % 360; free.tz = clamp(free.tz, -court.halfL, court.halfL);
+    const fx = court.halfW + 5.2, fz = court.halfL + 7.2, cp = Math.cos(free.pitch * D2R) * free.dist;
+    let x = Math.cos(free.yaw * D2R) * cp, z = free.tz + Math.sin(free.yaw * D2R) * cp; const y = Math.max(1.2, 0.9 + Math.sin(free.pitch * D2R) * free.dist);
+    if (Math.abs(Math.abs(x) - fx) < 0.6 && Math.abs(z) < fz + 0.6 && y < 1.93) x = Math.sign(x) * (fx + 0.6);       // within 0.6 m of a side wall's plane (1.33 m tall): push it outward
+    if (Math.abs(Math.abs(z) - fz) < 0.6 && Math.abs(x) < fx + 0.6 && y < 3.07) z = Math.sign(z) * (fz + 0.6);       // and of a windscreen's (2.47 m)
+    camera.position.set(x, y, z); camera.lookAt(vB.set(0, 0.9, free.tz)); lens(fovFor(50, aspect), aspect);
+  }
+  // Menu: from behind a baseline, level gaze, wide: sky and palms instead of "green court, green mounds". It drifts by itself.
+  const menuSide = () => (spectator || at.on ? 0 : localSide);       // side 0 looks north at the hills
+  function menuPose(aspect) {
+    const s = sgn(menuSide()), d = still ? 0 : 1, y = 3.4 + Math.sin(timeS / 7.3 + 1) * 0.12 * d;
+    camera.position.set(Math.sin(timeS / 5.2) * 0.9 * d, y, s * (court.halfL + 7)); camera.lookAt(vB.set(0, y, -s * court.halfL)); lens(fovFor(60, aspect), aspect);
+  }
+  // The winner's shot: a cut to a camera in front of the winner, a little to the trophy's side, that pushes in over 1.5 s and then drifts. It frames
+  // 3.2 m of height (the Mii, the cup at its shoulder and room to stretch up or duck: Body still moves them) inside the pane the result panel leaves free: the lens axis lands on the pane's centre.
+  // Near the net the camera stays on the winner's own side of it and the lens widens instead. No seat there (they left): the same shot of where they stood.
+  function victoryPose(aspect, dt) {
+    const pd = pads[vic.side], s = sgn(vic.side), P = vic.pane, tx = pd.has ? pd.bodyX + s * 0.3 : 0, tz = pd.has ? pd.bodyZ : s * 6.5;
+    if (vic.t === 0) { vic.cx = tx; vic.cz = tz; } else { const k = damp(dt, 0.3); vic.cx = lerp(vic.cx, tx, k); vic.cz = lerp(vic.cz, tz, k); }
+    vic.t += dt;
+    const u = 1 - Math.min(1, vic.t / 1.5), zoom = still ? 1 : 1 + 0.85 * u * u * u, drift = still ? 0 : Math.sin(timeS / 4.3) * 0.28;
+    const D = clamp(vic.cz * s - 0.6, 1.9, 4.2), ref = Math.hypot(D, 0.75);
+    camera.position.set(vic.cx + s * (0.75 + drift), 1.3 + (zoom - 1) * 1.1, vic.cz - s * D * zoom); camera.lookAt(vB.set(vic.cx, 1.3, vic.cz));
+    vicLight.position.set(camera.position.x + s * 1.2, 3.2, camera.position.z); vicLight.target.position.copy(vB); vicLight.intensity = 1.5 * Math.min(1, vic.t / 0.4);
+    const hh = Math.max(1.6 / P.fh, 1.25 / P.fw / aspect), hw = hh * aspect, n = camera.near / ref;
+    camera.aspect = aspect; camera.fov = 2 * Math.atan(hh / ref) / D2R;
+    camera.projectionMatrix.makePerspective(-hw * (1 + P.px) * n, hw * (1 - P.px) * n, hh * (1 - P.py) * n, -hh * (1 + P.py) * n, camera.near, camera.far);
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+  }
+  function setVictory(side, pane) {                        // side 0 | 1: that seat won, show it. Anything else: back to the game's own cameras (a cut both ways)
+    if (pane && isFinite(pane.fw + pane.fh + pane.px + pane.py)) { const P = vic.pane; P.fw = clamp(pane.fw, 0.2, 1); P.fh = clamp(pane.fh, 0.2, 1); P.px = clamp(pane.px, -0.8, 0.8); P.py = clamp(pane.py, -0.8, 0.8); }
+    const sd = side === 0 || side === 1 ? side : -1; if (sd === vic.side) return;
+    vic.side = sd; vic.t = 0; vic.hopAt = timeS + 0.5; easeT = 1; cam.shake = 0; for (const st of povSt) st.cut = true;
+    if (sd < 0) { trophy.visible = false; return; }
+    const w = pads[sd]; if (w.has) burst([w.world.x, w.world.y + 0.9, w.world.z], 0.9, 34, 3.4, [0xffd23a, 0xfff1a8, 0xffffff, 0xff9d2e]);      // the cup arrives in a puff of gold
+  }
+  const easeFrom = { p: new THREE.Vector3(), q: new THREE.Quaternion(), m: new THREE.Matrix4() };
+  // One picture: pose the camera for the mode, ease out of the menu pose if a menu just closed, dress the scene for that camera.
+  function updateCamera(dt, aspect) {
+    let back = -1, sd = -1; const v = vicOn();
+    if (menu) { menuPose(aspect); back = menuSide(); }
+    else if (v) victoryPose(aspect, dt);                   // every fence stands, and nobody is see-through: the winner is looked at, not through
+    else if (!spectator) { playPose(localSide, view, aspect, true, dt); back = localSide % 2; }
+    else if (vName === 'pov') { playPose(vSide, povSt[vSide], aspect, false, dt); back = vSide % 2; }
+    else if (vName === 'free') { freePose(aspect); const p = camera.position; sd = p.x > court.halfW + 5.2 ? 0 : p.x < -court.halfW - 5.2 ? 1 : -1; back = p.z > court.halfL + 7.2 ? 0 : p.z < -court.halfL - 7.2 ? 1 : -1; }
+    else { broadcastPose(aspect); sd = 0; }
+    if (easeT < 1) {                                       // the court opens: menu pose -> this pose, once (position, aim and lens together)
+      easeT = Math.min(1, easeT + dt / 0.8); const k = ease(easeT), a = easeFrom.m.elements, m = camera.projectionMatrix.elements;
+      vA.copy(camera.position); camera.position.copy(easeFrom.p).lerp(vA, k); qA.copy(camera.quaternion); camera.quaternion.copy(easeFrom.q).slerp(qA, k);
+      for (let i = 0; i < 16; i++) m[i] = lerp(a[i], m[i], k); camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+    }
+    dress(v ? -1 : eyeSide(), back, sd);
+  }
+
+  // ---------- WebAudio, no assets ----------
+  // The output device is the player's to choose (NOTES 60): an AirPod in one ear is a paddle, not a speaker, so the game
+  // can be sent to the laptop's speakers instead. `muted` is kept here because master does not exist until the first gesture.
+  let ac = null, master = null, noiseBuf = null, muted = false;
+  const GAIN = 0.7;
+  function unlockAudio() {
+    try {
+      if (!ac) {
+        const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+        ac = new AC(); master = ac.createGain(); master.gain.value = muted ? 0 : GAIN;
+        const comp = ac.createDynamicsCompressor(); master.connect(comp); comp.connect(ac.destination);
+        noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+        const d = noiseBuf.getChannelData(0), r = rng(5); for (let i = 0; i < d.length; i++) d[i] = r() * 2 - 1;
+      }
+      if (ac.state !== 'running') ac.resume();
+    } catch (e) { ac = null; }
+  }
+  const panOf = x => (spectator ? 0 : clamp(sgn(localSide) * (x - cam.x) / 4.5, -1, 1));       // a spectator's left and right are not the court's: centred
+  function out(pan) {                                     // -> node to connect a voice into
+    if (!ac.createStereoPanner) return master;
+    const p = ac.createStereoPanner(); p.pan.value = pan; p.connect(master); return p;
+  }
+  function tone(dst, type, f0, f1, tGlide, gain, decay, at = 0) {
+    const t = ac.currentTime + at, o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + tGlide);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(gain, t + 0.002); g.gain.exponentialRampToValueAtTime(0.0001, t + decay);
+    o.connect(g); g.connect(dst); o.start(t); o.stop(t + decay + 0.02);
+  }
+  function noise(dst, f0, f1, f2, Q, gain, dur, attack, at = 0) {      // at: seconds from now, so a jingle can place its crash on the stamp's impact
+    const t = ac.currentTime + at, src = ac.createBufferSource(), bp = ac.createBiquadFilter(), g = ac.createGain();
+    src.buffer = noiseBuf; src.loop = true; bp.type = 'bandpass'; bp.Q.value = Q;
+    bp.frequency.setValueAtTime(f0, t); bp.frequency.exponentialRampToValueAtTime(f1, t + dur * 0.45); bp.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(gain, t + attack); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(bp); bp.connect(g); g.connect(dst); src.start(t, rndFx() * 0.5); src.stop(t + dur + 0.02);
+  }
+  let jingleBus = null;
+  function jingleOut() {                                  // each jingle has its own gain; a new one cuts the old (a won final is followed at once by the champion card)
+    const now = ac.currentTime;
+    if (jingleBus) { const g = jingleBus.gain, old = jingleBus; g.cancelScheduledValues(now); g.setValueAtTime(g.value, now); g.linearRampToValueAtTime(0, now + 0.06); setTimeout(() => { try { old.disconnect(); } catch { /* already gone */ } }, 400); }
+    jingleBus = ac.createGain(); jingleBus.gain.value = 1; jingleBus.connect(out(0)); return jingleBus;      // out(0) -> master: mute and the chosen speaker apply
+  }
+  const sfx = {
+    pock(n, x) {                                          // hollow plastic: pitched body + low cavity + bright click
+      if (!ac || muted) return; const d = out(panOf(x)), f = 880 + 520 * n, g = 0.6 + 0.7 * n;
+      tone(d, 'sine', 170 + 60 * n, 70, 0.004, 0.35 + 0.5 * n, 0.16);          // the thump you feel: gets heavier with power
+      tone(d, 'sine', f * 1.6, f, 0.018, g, 0.085); tone(d, 'triangle', f * 0.5, f * 0.46, 0.05, g * 0.5, 0.13);
+      noise(d, 3200, 2400, 1800, 0.8, g * 0.5, 0.03, 0.001);
+    },
+    spike(n,x) { if(!ac||muted)return;const d=out(panOf(x));tone(d,'sine',1600+400*n,620,.025,.14+.1*n,.075);tone(d,'triangle',110,55,.045,.09+.07*n,.13);noise(d,6500,3800,1800,.65,.12+.08*n,.045,.001); },
+    net(x, strength) { if (!ac || muted) return; const d = out(panOf(x)); tone(d, 'triangle', 160, 65, .09, .12 + strength * .08, .2); tone(d, 'sine', 310, 190, .12, .065, .27); noise(d, 900, 500, 260, .8, .045 + strength * .04, .09, .003); },
+    bounce(x) { if (!ac) return; const d = out(panOf(x)); tone(d, 'sine', 760, 560, 0.03, 0.16, 0.07); tone(d, 'triangle', 300, 250, 0.05, 0.1, 0.1); noise(d, 1500, 1100, 800, 0.7, 0.05, 0.03, 0.001); },
+    whoosh(x, g = 0.2, mine = false) { if (!ac) return; noise(out(panOf(x)), 420, 2100, 650, 1.3, g, mine ? 0.22 : 0.3, mine ? 0.025 : 0.09); },   // mine: no slow swell, it is already late
+    chime(win) {
+      if (!ac) return; const d = out(0), ns = win ? [783.99, 1174.66] : [587.33, 440];
+      ns.forEach((f, i) => { tone(d, 'sine', f, f, 0.01, 0.3, 0.7, i * 0.17); tone(d, 'triangle', f * 2, f * 2, 0.01, 0.07, 0.4, i * 0.17); });
+    },
+    pointWin() {
+      if (!ac || muted) return;
+      const d = out(0);
+      [523.25, 659.25, 783.99].forEach((f, i) => { tone(d, 'triangle', f * .97, f, .025, .13, .42, i * .065); tone(d, 'sine', f * 2, f * 2, .01, .027, .3, i * .065); });
+    },
+    // The result card's sting (ui.css data-beat): win/watch = thump + crash on the GAME! stamp's impact (114 ms), a G-C-E pickup, a top G and a
+    // C major chord; champ adds a sparkle and a second crash; forfeit is the pickup alone (nobody was beaten); lose sighs A-G down onto a warm
+    // C major, never minor and never silence. Chord voices stay <= .12 so the DynamicsCompressor on master does not pump.
+    jingle(kind) {
+      if (!ac) return; const d = jingleOut();
+      const n = (f, at, dur, g, type = 'triangle') => { tone(d, type, f, f, 0.01, g, dur, at); tone(d, 'sine', 2 * f, 2 * f, 0.01, g * 0.25, dur * 0.6, at); };      // a note: its body + a soft octave on top
+      const pickup = g => { n(392, 0.14, 0.16, g); n(523.25, 0.23, 0.16, g); n(659.25, 0.32, 0.16, g); };
+      if (kind === 'forfeit') { pickup(0.12); n(783.99, 0.44, 0.16, 0.12); return; }
+      if (kind === 'lose') { tone(d, 'sine', 130.81, 130.81, 0.01, 0.10, 1.6, 0.44); n(440, 0.44, 0.4, 0.12); n(392, 0.60, 0.4, 0.12);
+        for (const f of [329.63, 392, 523.25]) tone(d, 'sine', f, f, 0.02, 0.10, 1.3, 0.80); return; }
+      tone(d, 'sine', 120, 50, 0.12, 0.4, 0.3, 0.11); noise(d, 7000, 5200, 3800, 0.6, 0.12, 0.7, 0.002, 0.11);      // win / watch / champ
+      pickup(0.16); n(783.99, 0.44, 0.6, 0.2); tone(d, 'square', 783.99, 783.99, 0.01, 0.06, 0.5, 0.44);
+      for (const f of [523.25, 659.25, 783.99, 1046.5]) n(f, 0.62, 1.0, 0.12);
+      if (kind === 'champ') { [[1318.5, 0.95], [1568, 1.02], [2093, 1.09]].forEach(([f, at]) => tone(d, 'sine', f, f, 0.01, 0.08, 0.5, at)); noise(d, 7000, 5200, 3800, 0.6, 0.10, 0.7, 0.002, 0.95); }
+    },
+    // the trophy row's ceremony (docs/TROPHIES.md 4). rankup: the champion's sparkle and second crash, no thump (it follows the win jingle, 2.1 s later).
+    // divup: one bright fifth, the sting of a division gained. Each takes the jingle bus: it cuts what was still ringing
+    rankJingle(kind) {
+      if (!ac) return; const d = jingleOut();
+      const n = (f, at, dur, g, type = 'triangle') => { tone(d, type, f, f, 0.01, g, dur, at); tone(d, 'sine', 2 * f, 2 * f, 0.01, g * 0.25, dur * 0.6, at); };
+      if (kind === 'divup') { n(523.25, 0, 0.25, 0.14); n(783.99, 0.12, 0.5, 0.16); tone(d, 'sine', 1568, 1568, 0.01, 0.06, 0.4, 0.12); return; }
+      if (kind === 'rankup') { [[1318.5, 0], [1568, 0.07], [2093, 0.14], [2637, 0.21]].forEach(([f, at]) => tone(d, 'sine', f, f, 0.01, 0.09, 0.6, at)); noise(d, 7000, 5200, 3800, 0.6, 0.11, 0.8, 0.002, 0.02); for (const f of [523.25, 659.25, 783.99, 1046.5]) n(f, 0.3, 1.1, 0.11); }
+    },
+    // one-shot cues off the jingle bus (they never cut a jingle): tick = a tiny click under the trophy count (8.9); tom = the floor tom of game point / match point (8.6)
+    cue(kind) {
+      if (!ac) return; const d = out(0);
+      if (kind === 'tick') tone(d, 'square', 2000, 2000, 0.01, 0.05, 0.02);
+      else if (kind === 'tom') { tone(d, 'sine', 90, 60, 0.12, 0.2, 0.25); noise(d, 400, 200, 120, 0.8, 0.05, 0.08, 0.002); }
+    },
+  };
+
+  // ---------- public API ----------
+  let smashAt = -9;                                       // when the last shot's smash was shown: it is shown ONCE, at the impact or in flight, never both
+  const smashHue = spin => (spin > 0.3 ? [0xd08bff, 0x8a5bff, 0xffffff] : [0xff5a1f, 0xffb340, 0xfff0a0]);      // purple with spin on it, fire without
+  function smashFx(p, side, spin, rs, sk) { smashAt = timeS; ring(p, false, 0.1 * rs, 2.6 * rs, 0.6, spin > 0.3 ? 0xb070ff : 0xff5a1f, 0.7); flashAt(p, 2.2);
+    burst(p, 1, 40, 9, smashHue(spin), -sgn(side) * 6); if (!still) cam.shake = Math.max(cam.shake, sk === 1 ? 0.28 : sk ? 0.16 : 0); }
+  // Most smashes are only CALLED a smash after the ball has gone: the swing is struck on its early bet and the settled report
+  // follows 60-200 ms later (measured on the real captures: 13 of 13), by which time the ball is 1-3 m down court. Replaying the
+  // whole flourish out there - a ring opening, a bloom, a shake - was a second impact, and it read as one: the hit seen twice.
+  // The late call rides the ball instead, the way the phone recolours its glow rather than flashing again (pad.js 'tint'):
+  // the shot catches fire in flight. Same colours, no impact of its own. rs: hitLook's scale, so the other end's smash
+  // throws its sparks as wide as its ring used to and still reads from across the court; mine stays close to the ball.
+  function igniteFx(side, spin, rs) { smashAt = timeS; burst([ball.pos.x, ball.pos.y, ball.pos.z], 1, 26, 4.5 * rs, smashHue(spin), -sgn(side) * 3 * rs); }
+  function spikeFx(pd,p,force,rs) {
+    if(!pd||quiet())return;
+    const fx=powerFx[pd.side];fx.spikeUntil=timeS+.24;fx.spikeColumn.position.set(p[0],Math.max(.1,p[1])*.5,p[2]);fx.spikeColumn.scale.set(1,Math.max(.1,p[1]),1);
+    energyExplosion(pd,p,[0xff7730,0xffbe4f,0xff5030,0xffffff],'spike',.55+.35*force);
+    ring(p,false,.08*rs,(1.8+force)*rs,.22,0xff7730,.85);flashAt(p,1.1+force*.65);
+  }
+  const hitLook = side => { const split = spectator && vName === 'split', mine = split || side === eyeSide();      // -> [ring scale, shake share]: mine, not mine, or none (two cameras, or the spectator's own hand on the camera)
+    return [mine ? 0.6 : 1, menu ? 0 : spectator ? (split || vName === 'free' ? 0 : vName === 'pov' && mine ? 1 : 0.55) : mine ? 1 : 0.55]; };
+  function onEvent(m) {
+    if (!m || !m.type || at.on) return;
+    if (m.type === 'ultimate') {
+      if (m.kind !== 'boost' && m.kind !== 'slow') return;
+      const team = Number.isInteger(m.targetTeam) ? m.targetTeam : m.kind === 'boost' ? m.side % 2 : 1 - m.side % 2;
+      const duration = Number.isFinite(m.until) && Number.isFinite(ball.tS) ? clamp(m.until - ball.tS, 0, 6) : 6;
+      for (const pd of pads) if (pd.side % 2 === team) { pd.ultimateUntil[m.kind] = timeS + duration; if (pd.has) ultimateBurst(pd, m.kind); }
+      if (ac && !muted) { const d = out(0), ns = m.kind === 'boost' ? [523.25, 783.99, 1046.5] : [659.25, 493.88, 329.63]; ns.forEach((f, i) => { tone(d, 'triangle', f * 0.9, f, 0.06, 0.16, 0.36, i * 0.065); tone(d, 'sine', f * 2, f * 2, 0.01, 0.035, 0.25, i * 0.065); }); }
+    } else if (m.type === 'launch') {
+      ball.lastBy = m.by; ballTake(ball, m, stampOf);       // a re-aim: the ball as it is and the bend from here (w); the drawn height stays on its arc
+      if (m.kind) ball.kind = m.kind;      // before the power: a re-aim into a smash (or into a lob) is shown as one
+      if (m.n != null && isFinite(m.n)) { ball.power = shownN(clamp(+m.n, 0, 1), ball.kind); ball.betN = null; }      // a re-aim: the hit went out on the early bet, this is the settled swing. The trail burns for THAT (a tap that was called 30 rad/s loses its flame)
+      if ((m.kind === 'smash' || m.kind === 'spike') && ball.seen) { if (timeS - smashAt > 0.3) igniteFx(m.by, ball.spin, hitLook(m.by)[0]); trail.glow = 1; }      // the settled swing, up to 0.25 s after the hit: the ball takes fire (unless the impact itself was already called a smash)
+      if (m.land && !menu) {
+        // A re-aim (n) of the flight the marker already shows glides it to the new landing (0.2 s, eased): it used to teleport and pop again on
+        // every re-aim, however little it moved (NOTES 154). A fresh shot's landing still appears with its pop.
+        if (m.n != null && marker.visible && mk.fade === 0 && mk.by === m.by) { mk.from = [marker.position.x, marker.position.z]; mk.to = [m.land[0], m.land[1]]; mk.g = 0; }
+        else { marker.visible = true; mk.t = 0; mk.fade = 0; mk.g = 1; mk.by = m.by; marker.position.set(m.land[0], 0.025, m.land[1]); }
+        marker.material.color.set(0xffffff); }      // white wherever it lands: the yellow for "coming to ME" read as a warning against the court's own yellows (NOTES 61)
+    } else if (m.type === 'hit') {
+      const n = clamp(+m.n || 0, 0, 1), force = Number.isFinite(m.force) ? clamp(m.force,0,1) : n, p = m.p || ball.p, pd = pads[m.side], [rs, sk] = hitLook(m.side);      // flight heat is n; contact feedback follows the measured physical force
+      // impact: three rings, a flash, twice the sparks, a harder shake and a ball that swells for a beat
+      ring(p, false, 0.12 * rs, (0.7 + force * 0.9) * rs, 0.34, 0xfff2a8); ring(p, false, 0.08 * rs, (0.42 + force * 0.5) * rs, 0.24, 0xffffff);
+      const sp = clamp(+m.spin || 0, 0, 1);                   // spin is continuous, so is its colour: yellow flat, icy blue at full spin (it used to flip at 0.5)
+      ring(p, false, 0.05 * rs, (1.0 + force * 1.3) * rs, 0.5, tmpC.set(0xffd23a).lerp(tmpD.set(0x9fe3ff), sp), 0.55);
+      burst(p, force, 22 + Math.round(force * 30), 3.6 + force * 6.5, [tmpC.set(0xfff6b0).lerp(tmpD.set(0xbfe9ff), sp).getHex(), tmpC.set(0xffd23a).lerp(tmpD.set(0x5ad1ff), sp).getHex(), 0xffffff], -sgn(m.side) * (2.5 + force * 4));
+      cameraPunch(force, p[0], sk); impactFrame(force);
+      if (m.kind==='spike') { spikeFx(pd,p,force,rs);smashAt=timeS; }
+      else if (force >= .65 && pd) energyExplosion(pd, p, [0xffd55f, 0xff9d39, 0xff603a, 0xffffff], 'impact', .5 + force * .45);
+      ball.spikeBounced=false;ball.impactForce=force;
+      ball.kind = m.kind || 'drive'; ball.betN = m.bet ? shownN(n, ball.kind) : null; ball.betUntil = timeS + 0.3;
+      const shown = shownN(m.bet ? Math.min(n, BET_SHOW) : n, ball.kind);      // the trail still follows the outgoing flight's actual power
+      flashAt(p, 0.5 + force * 0.9); ball.pulse = 1; ball.power = ball.hot = shown;      // the trail takes this shot's colour at once, not eased up from the last one
+      if (m.kind === 'smash') smashFx(p, m.side, m.spin, rs, sk);
+      trail.glow = 0.8 + 0.2 * shown; ballTake(ball, m, stampOf);      // the ball record: spin, the blend onto the new path, this contact's arc, and the launch that rides on the hit
+      if (pd) { pd.hitForce=force;pd.forceUntil=timeS+.35;pd.swooshUntil=Math.max(pd.swooshUntil||0,timeS+.25);pd.lunge = 1; pd.reach = pd.has; pd.hitP = [p[0], p[1], p[2]]; if (pd.bot && (pd.swingT < 0 || pd.swingT > 0.32 || pd.swingT < SWING_CONTACT - 0.06)) startSwing(pd, SWING_CONTACT - 0.04); }
+      const rx = pads[1 - m.side % 2]; if (rx && rx.bot) rx.stance.split = 1;      // Matt split-steps as the ball comes off the other paddle
+      sfx.pock(force, p[0]);if(m.kind==='spike')sfx.spike(force,p[0]); if (m.spin > 0.12 && ac && !muted) noise(out(panOf(p[0])), 5200, 3000, 1600, 0.9, 0.2 * Math.min(1, m.spin) ** 1.5, 0.11, 0.004);   // spin hisses off the face, as loud as there is spin: 0.5 -> 0.07, 0.8 -> 0.14, 1 -> 0.2
+    } else if (m.type === 'swung') {
+      const pd = pads[m.side]; if (!pd) return;
+      pd.swooshUntil = timeS + 0.5;                          // the blur belongs to the swing, never to plain movement
+      if (pd.bot && pd.swingT < 0) startSwing(pd);
+      if (timeS - pd.swungAt < 0.25) return; pd.swungAt = timeS;          // main may play it locally AND the server echoes it: once
+      sfx.whoosh(pd.pos.x, isMe(m.side) ? 0.22 : 0.12, isMe(m.side));
+    } else if (m.type === 'bounce') {
+      const p = m.p || ball.p; ring(p, true, 0.1, 0.55, 0.4, 0xffffff, 0.7, false);
+      if(ball.kind==='spike'&&!ball.spikeBounced&&!quiet()){ball.spikeBounced=true;ring([p[0],.035,p[2]],true,.12,1.8,.32,0xff7730,.8);burst([p[0],.07,p[2]],ball.impactForce||0,14,2.6,[0xff7730,0xffbe4f,0xffffff]);}
+      burst([p[0], 0.06, p[2]], 0, 5, 1.2, [0xd8e6f5, 0xffffff]);
+      if (marker.visible && mk.fade === 0) mk.fade = 1e-4;
+      sfx.bounce(p[0]);
+    } else if (m.type === 'net') {
+      ballTake(ball, m, stampOf);
+      if (!ball.netHit) return;
+      trail.pts.length = 0; trail.glow = 0; marker.visible = false; spinW = serveA = 0;
+      ballMesh.position.copy(ball.pos); ballMesh.scale.setScalar(1);
+      const speed = Array.isArray(m.incoming) ? Math.hypot(...m.incoming) : 8, strength = clamp(speed / 18, 0, 1);
+      if (!quiet()) {
+        Object.assign(netFx, {age: 0, x: m.p[0], y: Math.min(court.net, m.p[1]), push: -Math.sign(m.p[2]), amplitude: still ? .035 : .16 + strength * .22});
+        sfx.net(m.p[0], strength);
+      }
+    } else if (m.type === 'serve') { clearUltimates(); clearCelebrations(); clearNet(); ballTake(ball, m, stampOf); ball.power = 0; ball.kind = ball.betN = null; trail.glow = 0.35; }
+    else if (m.type === 'point') {
+      clearUltimates(); clearCelebrations();
+      if (marker.visible && mk.fade === 0) mk.fade = 1e-4;
+      celebratePoint(m.winner % 2);
+      if (!m.final) { if (spectator || m.winner === localSide % 2) sfx.pointWin(); else sfx.chime(false); }      // final points retain the result card's original jingle
+    } else if (m.type === 'whiff' && !spectator) { const me = pads[localSide]; if (ac) noise(out(panOf(me.pos.x)), 900, 500, 260, 1.0, 0.1, 0.22, 0.04); }
+  }
+
+  function updatePaddle(side, d) {
+    const pd = pads[side]; if (!pd || at.on) return;
+    if (!d) { pd.has = pd.init = false; pd.status = null; pd.ultimateUntil.boost = pd.ultimateUntil.slow = 0; setName(pd, ''); return; }
+    const t = pd.tgt; pd.has = true;
+    if (d.ultimate) for (const kind of ['boost', 'slow']) pd.ultimateUntil[kind] = timeS + clamp(Number.isFinite(d.ultimate[kind]) ? d.ultimate[kind] : 0, 0, 6);
+    const st = TAG_WORD[d.status] ? d.status : null; if (st !== pd.status) { pd.status = st; if (st && st !== pd.tagFor) { pd.tagFor = st; pd.tag.material.map = tagTexture(st); pd.tag.material.needsUpdate = true; } }      // the tag keeps its last word while it fades out
+    pd.bot = !!d.bot; if (pd.matt !== pd.bot) paint(pd, pd.bot);      // bot:true IS Matt, at every level
+    if (Object.prototype.hasOwnProperty.call(d, 'name')) setName(pd, d.name); else if (pd.bot && !pd.nameFor) setName(pd, 'Matt');
+    if (isFinite(d.x)) t.x = d.x; if (isFinite(d.y)) t.y = d.y; if (isFinite(d.z)) t.z = d.z;
+    if (d.q && d.q.length === 4 && isFinite(d.q[0] + d.q[1] + d.q[2] + d.q[3])) { t.q.set(d.q[0], d.q[1], d.q[2], d.q[3]); if (t.q.lengthSq() > 1e-6) t.q.normalize(); else t.q.identity(); }
+    t.off = d.offset && d.offset.length === 3 && isFinite(d.offset[0] + d.offset[1] + d.offset[2]) ? d.offset : null;
+  }
+
+  function updateBall(p, v, live, tMs, spin, m) {         // tMs optional (tests); default = when the server made it, on the rAF clock. spin optional: the state packet's
+    if (!p || !v || at.on) return;                         // m optional: the state packet itself ({ t, b, k, c, w, serving }), for the clock and for coast()
+    ball.ext = tMs != null;
+    ballState(ball, p, v, live, tMs == null ? madeAt(m ? +m.t : NaN, performance.now()) : tMs, spin, m, tMs == null && m ? +m.t : NaN);
+    if (m) ball.heldBy = m.serving != null ? +m.serving : -1;
+  }
+
+  function hideBall() { if (at.on) return; clearNet(); ball.netHit = null; ball.seen = ball.live = false; ballMesh.visible = blob.visible = trailMesh.visible = spinFx.visible = serveFx.visible = marker.visible = false; serveA = 0; trail.pts.length = 0; }   // the match it belonged to is over (opponent left, back to the lobby)
+
+  // ---------- attract rally ----------
+  // `by` strikes the ball at `from` at rally time t0. Pick a landing spot and an arc, solve the launch so it lands there and clears the
+  // net, then look along that flight (coast(): the very function that draws it) for where the other one meets it, and send them there.
+  const aP = new THREE.Vector3(), aV = new THREE.Vector3();
+  function attractShot(by, from, t0) {
+    const r = at.rnd, s = sgn(by), kind = r(), arc = kind < 0.45 ? 0 : kind < 0.8 ? 1 : 2, st = at.stats;          // drive / soft / lob-ish
+    const spin = r() < 0.3 ? 0.45 + r() * 0.55 : 0, g = G * (1 - SPUN.lift * spin), kick = spin ? (r() - 0.5) * 1.2 * spin : 0;   // now and then a slice: the trail goes icy
+    const deep = arc === 1 ? r() * 0.75 : 0.55 + r() * 0.45;                                                            // drives and lobs land deep, soft ones anywhere past the kitchen line
+    const tx = (r() * 2 - 1) * (court.halfW - 0.4), tz = -s * lerp(court.kitchen + 0.4, court.halfL - 0.4, deep);        // 0.4 m inside the lines, always
+    let T = [0.75, 1.1, 1.6][arc] * (0.92 + r() * 0.16), v = null, over = 0;
+    for (let i = 0; i < 40; i++) { v = [(tx - from[0]) / T, (BALL_R - from[1]) / T + 0.5 * g * T, (tz - from[2]) / T];
+      const tn = -from[2] / v[2]; over = from[1] + v[1] * tn - 0.5 * g * tn * tn - BALL_R - court.net; if (over >= 0.25) break; T += 0.05; }      // too flat for the net: give it more air
+    let best = T + 0.3, cost = 1e9;
+    for (let t = T + 0.1; t < T + 1.8; t += 1 / 90) {       // after the bounce: a comfortable height, not miles behind the baseline, on the way down if there is a choice
+      coast(aP, aV, from, v, t, spin, 0, kick); if (aP.y <= BALL_R + 1e-4) break;                                        // second bounce: too late
+      const c = Math.abs(aP.y - 1.0) + (aV.y > 0 ? 0.12 : 0) + 3 * Math.max(0, -aP.z * s - court.halfL - 1.4) + 3 * Math.max(0, Math.abs(aP.x) - court.halfW - 1.6);
+      if (c < cost) { cost = c; best = t; }
+    }
+    coast(aP, aV, from, v, best, spin, 0, kick);
+    Object.assign(at, { by, p: [from[0], from[1], from[2]], v, t0, spin, kick, n: [0.5, 0.12, 0.3][arc] + r() * 0.1, hitAt: t0 + best, hitP: [aP.x, aP.y, aP.z], swung: false });
+    const shown = arc === 2 ? 0 : at.n;      // the demo's lobs burn white like the real ones
+    ball.spin = spin; ball.power = ball.hot = shown; ball.lastBy = by; trail.glow = Math.max(trail.glow, 0.45 + 0.4 * shown);
+    st.shots++; st.net = Math.min(st.net, over); if (Math.abs(tx) > court.halfW - 0.399 || Math.abs(tz) > court.halfL - 0.399 || over < 0.25) st.out++;
+    const go = (side, to, a, b, bh) => { const t = pads[side].tgt; Object.assign(at.run[side], { from: [t.x, t.y, t.z], to, t0: a, t1: b, bh }); };
+    const bh = r() < 0.35;                                  // the paddle waits beside the ball: a touch inside it for a forehand, well outside for a backhand (the hit's reach closes the rest)
+    go(1 - by, [aP.x - s * (bh ? 0.32 : -0.06), clamp(aP.y - 0.28, 0.35, 1.7), aP.z - s * 0.25], t0, t0 + best * 0.8, bh);   // there with a fifth of the flight to spare: never a miss
+    go(by, [(r() - 0.5) * 1.6, 1, s * 6.5], t0 + 0.18, t0 + 1.1, false);                                                // the striker recovers to the middle
+  }
+  function attractStep(dt) {
+    at.t += dt;
+    for (const pd of pads.slice(0, 2)) { const r = at.run[pd.side], k = ease(clamp((at.t - r.t0) / (r.t1 - r.t0), 0, 1)), t = pd.tgt; t.x = lerp(r.from[0], r.to[0], k); t.y = lerp(r.from[1], r.to[1], k); t.z = lerp(r.from[2], r.to[2], k); }
+    const rc = pads[1 - at.by], run = at.run[rc.side];
+    if (!at.swung && at.t >= at.hitAt - SWING_CONTACT) { at.swung = true; startSwing(rc); rc.mirror = run.bh ? -1 : 1; }  // the existing bot swing, wound up so contact lands mid-sweep
+    if (at.t < at.hitAt) return;
+    const gap = Math.hypot(rc.pos.x - run.to[0], rc.pos.z - run.to[2]); at.stats.gap = Math.max(at.stats.gap, gap); if (gap > 0.5 || rc.swingT < 0) at.stats.late++;   // test/scene-next.mjs holds this at 0
+    rc.lunge = 1; rc.reach = true; rc.hitP = at.hitP; pads[1 - rc.side].stance.split = 1;
+    attractShot(rc.side, at.hitP, at.hitAt);
+  }
+  // The podium (NOTES 178; main.js showChamp): the champion alone on the court, at their baseline, for the champion screen's shot (setVictory puts the
+  // trophy in their hand). o = { side, matt, look, live }: live = the champion is me, and main.js feeds my paddle every frame; otherwise the seat is a
+  // canned 'bot' (the wave) painted as a person (or Matt) with the username's own look. null: the attract rally again.
+  let podiumOn = false;
+  function podium(o) {
+    if (!o) { if (podiumOn) { podiumOn = false; startAttract(); } return; }
+    if (at.on) stopAttract(); podiumOn = true; const sd = o.side === 1 ? 1 : 0;
+    for (const pd of pads) { const mine = pd.side === sd, s = sgn(pd.side), t = pd.tgt; pd.has = mine; pd.init = false; pd.bot = mine && !o.live; pd.status = null; pd.swingT = -1; pd.lunge = 0; pd.cheer = 0; pd.swooshUntil = 0;
+      pd.look = mine && LOOKS[o.look] ? o.look : null; paint(pd, mine && !!o.matt); t.x = 0; t.y = 1; t.z = s * 6.5; t.off = null; t.q.identity(); }
+    hideBall();
+  }
+  function startAttract() {
+    if (at.on) return; for (const pd of pads.slice(2)) pd.has = pd.init = false; at.on = true; at.t = 0; at.rnd = rng(20260920); Object.assign(at.stats, { shots: 0, late: 0, out: 0, net: 9, gap: 0 }); stopFx();
+    for (const pd of pads.slice(0, 2)) { const s = sgn(pd.side), t = pd.tgt; pd.has = true; pd.init = false; pd.bot = true; pd.status = null; paint(pd, pd.side === 1); pd.swingT = -1; pd.lunge = 0; pd.cheer = 0; pd.swooshUntil = 0;
+      t.x = 0; t.y = 1; t.z = s * 6.5; t.off = null; Object.assign(at.run[pd.side], { from: [0, 1, s * 6.5], to: [0, 1, s * 6.5], t0: 0, t1: 1 }); }
+    Object.assign(ball, { seen: true, live: true, snap: false, blend: false, held: false, pulse: 0 }); trail.pts.length = 0;
+    attractShot(0, [0.5, 1.0, 6.2], 0);                     // no serve ritual: the rally is simply under way
+  }
+  function stopAttract() {                                 // the next welcome / state draws the real match from nothing
+    if (!at.on) return; at.on = false; hideBall(); ball.spin = ball.power = 0; ball.lastBy = -1;
+    for (const pd of pads) { pd.has = pd.init = pd.bot = false; pd.swingT = -1; pd.lunge = 0; paint(pd, false); }
+    clock.reset();
+  }
+
+  function resize() {
+    const w = size.w = containerEl.clientWidth || window.innerWidth, h = size.h = containerEl.clientHeight || window.innerHeight;
+    renderer.setPixelRatio(pixelRatio()); renderer.setSize(w, h); force = true;      // setSize wipes the canvas: the next frame must not be one the 30 fps cap skips
+    camera.aspect = w / h; camera.fov = fovFor(cam.fovBase, camera.aspect);
+    camera.updateProjectionMatrix();
+  }
+
+  function setMenu(on) {
+    on = !!on; if (on === menu) return;
+    if (!on) { easeFrom.p.copy(camera.position); easeFrom.q.copy(camera.quaternion); easeFrom.m.copy(camera.projectionMatrix); }      // the menu pose as last drawn (before resize() touches the lens)
+    menu = on; resize(); syncInput();
+    if (on) { stopFx(); shadowHold = 1; easeT = 1; }
+    else { renderer.shadowMap.autoUpdate = !dim; renderer.shadowMap.needsUpdate = true; shadowHold = 0;
+      const split = spectator && vName === 'split'; easeT = split || !drawn ? 1 : 0;                   // two cameras cannot ease out of one: split is a cut
+      for (const st of povSt) st.cut = true; }
+  }
+  function setDim(on) {                                    // main.js: paused against Matt with the settings card (and so the blur) up. Nothing moves but Matt's idle sway: half the pixels, 30 fps, the shadow map as it stands
+    on = !!on; if (on === dim) return; dim = on; if (menu) return; resize();
+    renderer.shadowMap.autoUpdate = !on; if (!on) renderer.shadowMap.needsUpdate = true;
+  }
+  const getView = () => (spectator ? { name: vName, side: vName === 'pov' ? vSide : 0 } : { name: 'play', side: localSide });
+  function setView(name, side = 0) {
+    if (spectator && VIEWS.includes(name)) { vName = name; if (name === 'pov') vSide = Number.isInteger(side) && side >= 0 && side < 4 ? side : 0; for (const st of povSt) st.cut = true; cam.shake = 0; if (name === 'split') easeT = 1; syncInput(); }      // changing view is a cut (an ease out of the menu, if one is running, carries on into the new view)
+    return getView();
+  }
+  function setSide(side) {                                 // 0 | 1: a seat. null: a spectator (both paddles remote, the view cameras). Anything else: seat 0, as ever
+    spectator = side === null; localSide = Number.isInteger(side) && side >= 0 && side < 4 ? side : 0; clock.reset(); cam.x = 0; view.x = view.y = view.vx = view.vy = 0; view.z = 0; for (const st of povSt) st.cut = true;
+    for (const pd of pads) pd.init = false; syncInput();
+  }
+  function setFrozen(on) {
+    on = !!on; if (on === frozen) return; frozen = on;
+    if (!on) { clock.reset(); ball.snap = true; ball.arc = null; if (!ball.ext) ball.stamp = performance.now(); }      // the server's t stood still while wall time ran: a stale offset would age every packet by the whole pause.
+    // The stamp too: every paused packet was dated to when the pause BEGAN, so the frame drawn before the next packet coasted the ball up to 0.6 s ahead and back (seen as a 3 m flick in test/spectate-e2e.mjs). Time starts again now.
+  }
+  // Free cam input lives here (MAIN forwards nothing): drag = orbit, wheel = zoom, right-drag / shift-drag / arrow keys = slide along the court, only while a spectator is in the free view with no menu up.
+  const canOrbit = () => spectator && vName === 'free' && !menu;
+  function syncInput() { renderer.domElement.style.touchAction = canOrbit() ? 'none' : ''; }
+  { const el = renderer.domElement; let drag = null;
+    const end = e => { if (!drag || e.pointerId !== drag.id) return; drag = null; try { el.releasePointerCapture(e.pointerId); } catch (_) {} };
+    const slide = (dx, dy) => { const y = free.yaw * D2R; free.tz = clamp(free.tz + (Math.cos(y) * dx - Math.sin(y) * dy) * free.dist * 0.0016, -court.halfL, court.halfL); };      // the court follows the hand here too: screen right is (sin yaw, -cos yaw) on the ground, and only the part of the drag along the court's axis counts
+    el.addEventListener('pointerdown', e => { if (!canOrbit() || drag) return; drag = { id: e.pointerId, x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey }; try { el.setPointerCapture(e.pointerId); } catch (_) {} });
+    el.addEventListener('pointermove', e => { if (!drag || e.pointerId !== drag.id) return; if (!canOrbit()) { drag = null; return; }
+      if (drag.pan) slide(e.clientX - drag.x, e.clientY - drag.y);
+      else { free.yaw += (e.clientX - drag.x) * 0.25; free.pitch = clamp(free.pitch + (e.clientY - drag.y) * 0.25, 6, 80); free.dist = Math.min(free.dist, freeMax()); }   // the court follows the hand, 0.25 deg per px
+      drag.x = e.clientX; drag.y = e.clientY; });
+    el.addEventListener('contextmenu', e => { if (canOrbit()) e.preventDefault(); });
+    addEventListener('keydown', e => { const d = { ArrowLeft: [40, 0], ArrowRight: [-40, 0], ArrowUp: [0, 40], ArrowDown: [0, -40] }[e.key]; if (!d || !canOrbit() || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.target.tagName === 'INPUT') return; e.preventDefault(); slide(d[0], d[1]); });      // (a focused view chip takes the arrows for itself: defaultPrevented)
+    el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+    el.addEventListener('wheel', e => { if (!canOrbit()) return; e.preventDefault(); free.dist = clamp(free.dist * Math.exp(e.deltaY * 0.0012), 6, freeMax()); }, { passive: false });
+  }
+
+  function render(nowMs) {                                 // -> true when a frame was drawn
+    const now = nowMs == null ? performance.now() : nowMs;
+    if (document.visibilityState === 'hidden') return false;                                        // nobody is looking: draw nothing, menu or not
+    if ((menu || dim) && !force && lastMs && now >= lastMs && now - lastMs < 30) return false;      // a menu (or a pause behind the blur) runs at 30 fps. dt below is between DRAWN frames
+    const dt = lastMs ? clamp((now - lastMs) / 1000, 0, 0.05) : 1 / 60; lastMs = now; timeS += dt; force = false; drawn++;
+    if (at.on) attractStep(dt);
+    trophy.visible = vicOn() && pads[vic.side].has; if (!trophy.visible) vicLight.intensity = 0;
+    updateBallVis(now, dt); updateNet(dt); updatePads(dt); if (!menu) updateFx(dt); updateUltimates();
+    cam.shake = still ? 0 : Math.max(0, cam.shake - dt * (0.35 + cam.shake * 6));
+    cam.kickX *= Math.exp(-dt * 18); cam.kickY *= Math.exp(-dt * 18);
+    renderer.domElement.style.filter = !still && timeS < impact.until ? `contrast(${1 + impact.strength * .24}) brightness(${1 + impact.strength * .085})` : '';
+    const w = size.w, h = size.h;
+    if (spectator && vName === 'split' && !menu && !vicOn()) {         // two viewports, one scene: each half is that player's own picture (their fence gone, their avatar a ghost forearm)
+      const tall = w <= h, wl = Math.floor(w / 2), ht = Math.floor(h / 2); renderer.setScissorTest(true);       // taller than wide: side 0 on top, side 1 under it (two 300 px columns cut both courts' corners off and gave 45 % of each to the sky). ui.css turns #split-line with the same test
+      for (let i = 0; i < 2; i++) { const x = tall || !i ? 0 : wl, ww = tall ? w : i ? w - wl : wl, y = tall && !i ? h - ht : 0, hh = tall ? (i ? h - ht : ht) : h;      // (GL's y runs up from the bottom)
+        vpW = ww; vpH = hh; playPose(i, povSt[i], ww / hh, false, dt); dress(i, i, -1); drawTrail(); faceFx();                // trail and rings are rebuilt for each camera
+        if (!i && scenery) scenery.update(dt, timeS, camera);                                           // once a frame, with the first camera
+        renderer.setViewport(x, y, ww, hh); renderer.setScissor(x, y, ww, hh); renderer.render(scene, camera); }
+      renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h);
+      return true;
+    }
+    vpW = w; vpH = h; updateCamera(dt, w / h); drawTrail(); faceFx(); if (scenery) scenery.update(dt, timeS, camera);
+    const hold = menu && shadowHold === 1;                 // a menu's shadow map is drawn ONCE, without the players (a moving avatar must not leave its shadow baked on the court)
+    if (hold) { for (const o of casters) o.castShadow = false; renderer.shadowMap.autoUpdate = true; renderer.shadowMap.needsUpdate = true; }
+    renderer.render(scene, camera);
+    if (hold) { for (const o of casters) o.castShadow = true; for (const pd of pads) if (pd.self) pd.avatar.traverse(m => { if (m.isMesh) m.castShadow = false; }); renderer.shadowMap.autoUpdate = false; shadowHold = 2; }      // your own see-through body still casts none
+    return true;
+  }
+
+  resize();
+  return {
+    setCourt(c) { if (c && isFinite(c.halfW + c.halfL + c.kitchen + c.net)) { court = { ...court, ...c }; buildCourt(); } },
+    setSide, setView, getView, setMenu, setDim, startAttract, stopAttract, setFrozen, setVictory, podium,
+    // where the player is relative to where they calibrated: -1..1, + = THEIR right / up (same for both sides).
+    // Call every frame while tracking is good; 500 ms without a call falls back to the local paddle position.
+    setViewer(v) { if (v && isFinite(v.x) && isFinite(v.y) && !spectator && !menu) { view.inX = v.x; view.inY = v.y; view.at = timeS; } },
+    updatePaddle, updateBall, hideBall, onEvent, unlockAudio, render, resize,
+    canReturn(side) {
+      const pd = pads[side];
+      if (!pd || !pd.has || !ball.seen || !ball.live || !ballMesh.visible || ball.heldBy === side || ball.vel.z * sgn(side) <= 0) return true;
+      return -(ballMesh.position.z - pd.pos.z) * sgn(side) >= 0;
+    },
+    jingle(kind) { if (['win', 'lose', 'watch', 'forfeit', 'champ'].includes(kind)) sfx.jingle(kind); else if (['rankup', 'divup'].includes(kind)) sfx.rankJingle(kind); },      // the result card's sting: main.js showOver / showChamp only; the trophy row's rank-up / division-up (docs/TROPHIES.md 4)
+    cue(kind) { if (kind === 'tick' || kind === 'tom') sfx.cue(kind); },      // small cues: the trophy count's clicks (main.js, the trophy ceremony)
+    // Sound. setSink takes a deviceId ('' = the system default) and resolves false when that device is gone, so the panel
+    // can fall back instead of naming a speaker nothing is coming out of.
+    // devices() is empty until the page holds a media grant: Chrome blanks BOTH the id and the label of every audio output
+    // until then (measured on Chrome 153). Poddle already asks for the camera, and that grant is enough — no microphone.
+    audio: {
+      canSwitch: () => !!(window.AudioContext && AudioContext.prototype.setSinkId),
+      devices: () => !navigator.mediaDevices?.enumerateDevices ? Promise.resolve([])
+        : navigator.mediaDevices.enumerateDevices().then(ds => ds.filter(d => d.kind === 'audiooutput' && d.deviceId && d.label).map(d => ({ id: d.deviceId, label: d.label })), () => []),
+      onDevicesChanged(fn) { try { navigator.mediaDevices?.addEventListener?.('devicechange', fn); } catch { /* not everywhere */ } },
+      ctx: () => ac,                                      // menuaudio.js plays through the same context: the chosen speaker applies to it
+      setMute(on) { muted = !!on; if (master) master.gain.value = muted ? 0 : GAIN; },
+      setSink(id) { unlockAudio(); return !ac || typeof ac.setSinkId !== 'function' ? Promise.resolve(false) : ac.setSinkId(id || '').then(() => true, () => false); },
+    },
+    setSelfBody(on) { selfBody = !!on; },                   // Settings > Show player model (dress() reads it every frame)
+    setLooks(a) { for (const pd of pads) { const k = Array.isArray(a) && LOOKS[a[pd.side]] ? a[pd.side] : null; if (k !== pd.look) { pd.look = k; paint(pd, pd.matt); } } },      // [side 0, side 1]: LOOKS keys (main.js, from lookFor(name, reg)) or null
+    _dbg: { renderer, scene, camera, VIEW, pads, ball, cam, impact, free, ballMesh, attract: at, trophy, vic, powerFx, netFx,       // test harness only
+      view: () => ({ ...getView(), menu, dim, attract: at.on, frozen, spectator, stacked: size.w <= size.h, pixelRatio: renderer.getPixelRatio(), drawn }) },
+  };
+}

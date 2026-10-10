@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ping Pong paddle</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0b1116">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="pad.css">
+</head>
+<body data-view="boot">
+<div id="glow" aria-hidden="true"></div>
+<main>
+  <h1 class="logo-mark" style="font-size:2.2rem"><span>Ping P</span><i class="logo-ball"></i><span>ng</span></h1>
+
+  <!-- no code in the link: type the one on the computer -->
+  <section class="view" data-name="code">
+    <h2>Your phone is the paddle</h2>
+    <p>Open <b>pingpong.mehdi.ch</b> on a computer and press Play. Type the code it shows.</p>
+    <form id="code-form" autocomplete="off">
+      <label class="code-field"><span class="code-pre" aria-hidden="true">P-</span><input id="code-in" inputmode="text" autocapitalize="characters" autocorrect="off" spellcheck="false" maxlength="8" placeholder="XXXX" aria-label="Paddle code, after P-"></label>
+      <button class="btn" id="code-go" type="submit">Next</button>
+    </form>
+    <p class="note" id="code-note"></p>
+  </section>
+
+  <section class="view" data-name="start">
+    <h2>Your phone is the paddle</h2>
+    <svg class="art" viewBox="0 0 300 170" aria-hidden="true"><g stroke="#5b6670" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="34" y="48" width="232" height="92" rx="18" fill="#fff"/><rect class="cam-plate" x="202" y="52" width="60" height="84" rx="14" fill="#e4ebf0" stroke="#5b6670" stroke-width="3.5"/><circle class="cam-lens" cx="218" cy="71" r="10" fill="#5b6670" stroke="none"/><circle class="cam-lens" cx="246" cy="71" r="10" fill="#5b6670" stroke="none"/><circle class="cam-lens" cx="232" cy="96" r="10" fill="#5b6670" stroke="none"/><circle class="cam-glass" cx="218" cy="71" r="5" fill="#2c3640" stroke="none"/><circle class="cam-glass" cx="246" cy="71" r="5" fill="#2c3640" stroke="none"/><circle class="cam-glass" cx="232" cy="96" r="5" fill="#2c3640" stroke="none"/><circle class="cam-glint" cx="216" cy="69" r="1.6" fill="#fff" stroke="none" opacity=".8"/><circle class="cam-glint" cx="244" cy="69" r="1.6" fill="#fff" stroke="none" opacity=".8"/><circle class="cam-glint" cx="230" cy="94" r="1.6" fill="#fff" stroke="none" opacity=".8"/><circle class="cam-flash" cx="218" cy="124" r="4.5" fill="#f6e7b0" stroke="#5b6670" stroke-width="2"/><circle class="cam-lens" cx="246" cy="124" r="3.5" fill="#5b6670" stroke="none"/>
+      <path d="M-10 70H40V128H-10" fill="#fdf3ea"/><rect x="30" y="56" width="74" height="80" rx="26" fill="#fdf3ea"/>
+      <rect x="38" y="70" width="17" height="56" rx="8.5" fill="#fdf3ea"/><rect x="55" y="68" width="17" height="60" rx="8.5" fill="#fdf3ea"/><rect x="72" y="68" width="17" height="58" rx="8.5" fill="#fdf3ea"/><rect x="89" y="70" width="16" height="52" rx="8" fill="#fdf3ea"/>
+      <rect x="46" y="48" width="70" height="22" rx="11" fill="#fdf3ea" transform="rotate(-6 46 59)"/></g>
+      <path d="M150 40V14M140 24l10-10 10 10" fill="none" stroke="#34beed" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><text x="168" y="28" font-size="20" font-weight="800" fill="#39434d">edge up</text></svg>
+    <p>Hold it like a paddle handle: <b>edge up</b>, screen facing sideways, top end pointing at your computer. <b>Grip it tight</b> and check behind you.</p>
+    <button class="btn btn-xl" id="go">Start</button>
+    <p class="note">Code <b id="start-code"></b> · <a href="pad.html" id="change">change</a></p>
+    <p class="legal">By playing you agree to the <a href="/terms.html">Terms</a> and <a href="/privacy.html">Privacy Policy</a>. Under 18? Ask a parent first.</p>
+  </section>
+
+  <section class="view" data-name="live">
+    <div class="ring" id="ring"><div class="ring-fill" id="ring-fill"></div><b id="ring-word">Ready</b></div>
+    <h2 id="live-h">Looking for your computer</h2>
+    <p id="live-p">Keep this page open. Watch the computer, not the phone.</p>
+    <div class="pad-ultimate" id="pad-ultimate" aria-label="Critical hit streak and ultimate ability" hidden>
+      <div class="pad-ultimate-head"><b>Critical streak</b><span id="pad-ultimate-charge">0 / 5</span></div>
+      <div class="pad-ultimate-meter" id="pad-ultimate-meter" role="progressbar" aria-label="Consecutive legal orange hits" aria-valuemin="0" aria-valuemax="5" aria-valuenow="0"><i id="pad-ultimate-fill"></i></div>
+      <div class="pad-ultimate-actions"><button class="btn btn-sm" id="pad-ultimate-boost" disabled>Swing speedup</button><button class="btn btn-sm" id="pad-ultimate-slow" disabled>Opponent slow</button></div>
+      <small id="pad-ultimate-status">5 orange hits in a row</small>
+    </div>
+    <div class="row">
+      <button class="btn btn-sm btn-hold" id="btn-cal">Calibrate again</button>
+      <button class="btn btn-sm btn-hold" id="btn-center">Recentre</button>
+    </div>
+    <p class="note">Press and hold a button to use it.</p>
+    <p class="note" id="live-note"></p>
+    <p class="note" id="haptic-note"></p>
+    <p class="note" id="live-stats"></p>
+    <!-- done playing: low and centred, never in a corner (a hand wrapped round the phone rests there), and held, not
+         tapped, like the other two buttons -->
+    <button class="btn-x btn-hold" id="btn-quit" aria-label="Done playing: press and hold to stop the paddle"><svg class="hold-ring" viewBox="0 0 48 48" aria-hidden="true"><circle class="hold-track" cx="24" cy="24" r="22"/><circle class="hold-arc" cx="24" cy="24" r="22"/></svg><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  </section>
+
+  <section class="view" data-name="done">
+    <h2>Paddle off</h2>
+    <p id="done-p">You can close this tab now.</p>
+    <button class="btn" id="again">Start again</button>
+  </section>
+
+  <section class="view" data-name="nomotion">
+    <h2>No motion sensors here</h2>
+    <p id="nomotion-p">This page turns a phone into the paddle. Open it on your phone: scan the code on your computer’s screen with the phone’s camera.</p>
+    <button class="btn" id="retry1">Try again</button>
+  </section>
+
+  <section class="view" data-name="denied">
+    <h2>Motion is switched off</h2>
+    <p id="denied-p">Ping Pong needs the phone’s motion sensors to be your paddle. Close this tab, scan the code again, and choose <b>Allow</b>.</p>
+    <button class="btn" id="retry2">Try again</button>
+  </section>
+</main>
+<script type="module" src="pad.js"></script>
+</body>
+</html>
